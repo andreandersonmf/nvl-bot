@@ -1,0 +1,7 @@
+.venv
+.git
+.gitignore
+__pycache__
+*.pyc
+README_MUDANCAS.md
+.env
