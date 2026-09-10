@@ -332,28 +332,30 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Transfer"):
             await interaction.response.send_message("You cannot deny this transfer.", ephemeral=True)
             return
 
+        # Two sequential DB round-trips follow before anything can be
+        # confirmed - ack immediately.
+        await interaction.response.defer(ephemeral=True)
+
         transfer = await database.fetchone("SELECT * FROM team_transactions WHERE id = $1", self.transaction_id)
         if not transfer:
-            await interaction.response.send_message("Transfer not found.", ephemeral=True)
+            await interaction.followup.send("Transfer not found.", ephemeral=True)
             return
 
         if transfer["status"] != "pending":
-            await interaction.response.send_message("This transfer has already been completed.", ephemeral=True)
+            await interaction.followup.send("This transfer has already been completed.", ephemeral=True)
             return
 
         team = await get_team_by_id(transfer["team_id"])
         guild = interaction.guild
         if guild is None or team is None:
-            await interaction.response.send_message("Could not locate the related data.", ephemeral=True)
+            await interaction.followup.send("Could not locate the related data.", ephemeral=True)
             return
 
         requester = guild.get_member(int(transfer["requester_discord_id"])) if transfer["requester_discord_id"] else None
         player = guild.get_member(int(transfer["player_discord_id"])) if transfer["player_discord_id"] else None
         if requester is None or player is None:
-            await interaction.response.send_message("Could not find the requester/player in the server.", ephemeral=True)
+            await interaction.followup.send("Could not find the requester/player in the server.", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=True)
 
         await database.update_returning(
             "team_transactions",
@@ -646,14 +648,18 @@ class TeamCog(commands.Cog):
 
     @team.command(name="info", description="Show the full information for a team")
     async def team_info(self, interaction: discord.Interaction, team: discord.Role):
+        # Two sequential DB round-trips follow - ack immediately so a
+        # slow moment never shows "The application did not respond".
+        await interaction.response.defer()
+
         team_row = await get_team_by_role(team.id)
         if not team_row:
-            await interaction.response.send_message("This team is not registered in the database.", ephemeral=True)
+            await interaction.followup.send("This team is not registered in the database.", ephemeral=True)
             return
 
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Guild not found.", ephemeral=True)
+            await interaction.followup.send("Guild not found.", ephemeral=True)
             return
 
         captain = guild.get_member(int(team_row["captain_discord_id"])) if team_row["captain_discord_id"] else None
@@ -701,7 +707,7 @@ class TeamCog(commands.Cog):
         )
         embed.set_footer(text="CVR SA Team System")
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @team.command(name="add", description="Request that a player be added to the team")
     @app_commands.choices(role=ROLE_CHOICES)

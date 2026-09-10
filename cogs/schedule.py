@@ -174,10 +174,14 @@ class ScheduleCog(commands.Cog):
             )
             return
 
+        # Three sequential DB round-trips follow - ack immediately so a
+        # slow moment never shows "The application did not respond".
+        await interaction.response.defer()
+
         team1_row = await get_team_by_role(team1.id)
         team2_row = await get_team_by_role(team2.id)
         if not team1_row or not team2_row:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Both teams must be registered (see /team create or the site admin panel) before scheduling a match.",
                 ephemeral=True
             )
@@ -202,7 +206,7 @@ class ScheduleCog(commands.Cog):
         embed.add_field(name="Date & Time (BRT)", value=target_dt.strftime("%d/%m/%Y %H:%M"), inline=False)
         embed.set_footer(text="15 minutes reminder enabled")
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @schedule.command(name="list", description="Lists scheduled matches")
     async def schedule_list(self, interaction: discord.Interaction):
@@ -256,13 +260,16 @@ class ScheduleCog(commands.Cog):
             )
             return
 
+        # Two sequential DB round-trips follow - ack immediately.
+        await interaction.response.defer()
+
         row = await database.fetchone("SELECT * FROM matches WHERE id = $1", match_id)
         if not row:
-            await interaction.response.send_message("This Match ID does not exist.", ephemeral=True)
+            await interaction.followup.send("This Match ID does not exist.", ephemeral=True)
             return
 
         if row["status"] != "Scheduled":
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Only matches still in `Scheduled` status can be removed with this command. "
                 "Use the site admin panel to edit a Live/Finished match.",
                 ephemeral=True
@@ -271,7 +278,7 @@ class ScheduleCog(commands.Cog):
 
         await database.execute("DELETE FROM matches WHERE id = $1", match_id)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Match **ID {match_id}** removed successfully.\n"
             f"{row['home_country']} vs {row['away_country']}"
         )

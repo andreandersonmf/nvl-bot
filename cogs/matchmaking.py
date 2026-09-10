@@ -1042,12 +1042,18 @@ class JoinQueueView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
+        # This does several sequential database calls (and possibly a
+        # VIP lookup) before it can know whether the join even
+        # succeeds. Ack immediately so a slow round-trip to Supabase
+        # never shows "This interaction failed" on the button click.
+        await interaction.response.defer()
+
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
             match_row = await get_match_by_number(self.match_number)
             if not match_row or match_row["status"] != "queue_open":
-                await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
+                await interaction.followup.send("This queue is no longer open.", ephemeral=True)
                 return
 
             existing_row = await database.fetchone(
@@ -1055,11 +1061,11 @@ class JoinQueueView(discord.ui.View):
                 self.match_number, database.did(interaction.user.id),
             )
             if existing_row:
-                await interaction.response.send_message("You are already in this queue.", ephemeral=True)
+                await interaction.followup.send("You are already in this queue.", ephemeral=True)
                 return
 
             if await is_user_busy(interaction.user.id):
-                await interaction.response.send_message("You are already in another active queue/match.", ephemeral=True)
+                await interaction.followup.send("You are already in another active queue/match.", ephemeral=True)
                 return
 
             count_row = await database.fetchone(
@@ -1073,7 +1079,7 @@ class JoinQueueView(discord.ui.View):
 
             if role_count >= ROLE_MAX_TOTAL[role_pref]:
                 if not is_vip_plus:
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         f"The {ROLE_LABELS[role_pref]} queue is already full.", ephemeral=True
                     )
                     return
@@ -1087,7 +1093,7 @@ class JoinQueueView(discord.ui.View):
                 )
                 total = total_row["total"] if total_row else 0
                 if total >= QUEUE_SIZE:
-                    await interaction.response.send_message("This queue is already full.", ephemeral=True)
+                    await interaction.followup.send("This queue is already full.", ephemeral=True)
                     return
 
             priority_weight = await vip_data.get_captain_priority_weight(interaction.user.id)
@@ -1104,10 +1110,9 @@ class JoinQueueView(discord.ui.View):
                     self.match_number, database.did(interaction.user.id), role_pref, priority_weight,
                 )
             except asyncpg.UniqueViolationError:
-                await interaction.response.send_message("You have already joined this queue.", ephemeral=True)
+                await interaction.followup.send("You have already joined this queue.", ephemeral=True)
                 return
 
-            await interaction.response.defer()
             await self.refresh_message(interaction)
 
     @discord.ui.button(label="Join Setter (0/2)", style=discord.ButtonStyle.primary, custom_id="temp_setter", row=0)
@@ -1139,12 +1144,16 @@ class JoinQueueView(discord.ui.View):
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         button.custom_id = f"mm_leave_queue_{self.match_number}"
 
+        # Ack immediately - two DB round-trips plus a delete precede the
+        # message refresh below.
+        await interaction.response.defer()
+
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
             match_row = await get_match_by_number(self.match_number)
             if not match_row or match_row["status"] != "queue_open":
-                await interaction.response.send_message("This queue is no longer open.", ephemeral=True)
+                await interaction.followup.send("This queue is no longer open.", ephemeral=True)
                 return
 
             row = await database.fetchone(
@@ -1153,7 +1162,7 @@ class JoinQueueView(discord.ui.View):
             )
 
             if not row:
-                await interaction.response.send_message("You are not in this queue.", ephemeral=True)
+                await interaction.followup.send("You are not in this queue.", ephemeral=True)
                 return
 
             await database.execute(
@@ -1161,7 +1170,6 @@ class JoinQueueView(discord.ui.View):
                 self.match_number, database.did(interaction.user.id),
             )
 
-            await interaction.response.defer()
             await self.refresh_message(interaction)
 
 
@@ -1203,16 +1211,20 @@ class TeamFormatVoteView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
+        # Ack immediately - up to two DB round-trips happen before the
+        # vote is even recorded below.
+        await interaction.response.defer()
+
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
             if self.resolved:
-                await interaction.response.send_message("Voting has already ended.", ephemeral=True)
+                await interaction.followup.send("Voting has already ended.", ephemeral=True)
                 return
 
             match_row = await get_match_by_number(self.match_number)
             if not match_row or match_row["status"] != "team_format_vote":
-                await interaction.response.send_message("Voting is no longer active.", ephemeral=True)
+                await interaction.followup.send("Voting is no longer active.", ephemeral=True)
                 return
 
             player_row = await database.fetchone(
@@ -1220,11 +1232,10 @@ class TeamFormatVoteView(discord.ui.View):
                 self.match_number, database.did(interaction.user.id),
             )
             if not player_row:
-                await interaction.response.send_message("Only players in this queue can vote.", ephemeral=True)
+                await interaction.followup.send("Only players in this queue can vote.", ephemeral=True)
                 return
 
             self.votes[database.did(interaction.user.id)] = choice
-            await interaction.response.defer()
 
             if len(self.votes) >= self.total_players:
                 await self._resolve(interaction.guild)
@@ -1356,12 +1367,16 @@ class CaptainPickSelect(discord.ui.Select):
             await interaction.response.send_message("Only Match Organizer can set captains.", ephemeral=True)
             return
 
+        # This can chain up to five sequential DB round-trips (plus a
+        # message fetch/edit) once both captains are set - ack right away.
+        await interaction.response.defer(ephemeral=True)
+
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
             match_row = await get_match_by_number(self.match_number)
             if not match_row or match_row["status"] != "captains_pending":
-                await interaction.response.send_message("This captain setup is no longer active.", ephemeral=True)
+                await interaction.followup.send("This captain setup is no longer active.", ephemeral=True)
                 return
 
             selected_discord_id = self.values[0]
@@ -1407,13 +1422,13 @@ class CaptainPickSelect(discord.ui.Select):
                         except discord.HTTPException:
                             pass
 
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"Captain {self.slot} set successfully.",
                     ephemeral=True
                 )
                 return
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Captain {self.slot} set successfully.",
                 ephemeral=True
             )
@@ -1437,10 +1452,12 @@ class CaptainSetupView(discord.ui.View):
             await interaction.response.send_message("Only Match Organizer can set captains.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         match_row = await get_match_by_number(self.match_number)
         options = await CaptainPickSelect.build_options(match_row, interaction.guild)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Choose Captain 1:",
             view=CaptainPickView(self.cog, self.match_number, 1, options),
             ephemeral=True
@@ -1452,10 +1469,12 @@ class CaptainSetupView(discord.ui.View):
             await interaction.response.send_message("Only Match Organizer can set captains.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         match_row = await get_match_by_number(self.match_number)
         options = await CaptainPickSelect.build_options(match_row, interaction.guild)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Choose Captain 2:",
             view=CaptainPickView(self.cog, self.match_number, 2, options),
             ephemeral=True
@@ -1477,19 +1496,24 @@ class PickPlayerButton(discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             return
 
+        # A draft pick can chain up to ~8 sequential DB round-trips
+        # before the embed/view are ready to show - ack immediately so
+        # a slow moment never shows "This interaction failed".
+        await interaction.response.defer()
+
         match_row = await get_match_by_number(self.match_number)
         if not match_row or match_row["status"] != "draft":
-            await interaction.response.send_message("This draft is no longer active.", ephemeral=True)
+            await interaction.followup.send("This draft is no longer active.", ephemeral=True)
             return
 
         captain_side = await get_captain_side(self.match_number, interaction.user.id)
         if not captain_side:
-            await interaction.response.send_message("Only the selected captains can pick players.", ephemeral=True)
+            await interaction.followup.send("Only the selected captains can pick players.", ephemeral=True)
             return
 
         current_turn_side = await get_current_turn_side(match_row)
         if captain_side != current_turn_side:
-            await interaction.response.send_message("It is not your turn to pick.", ephemeral=True)
+            await interaction.followup.send("It is not your turn to pick.", ephemeral=True)
             return
 
         player_row = await database.fetchone(
@@ -1497,7 +1521,7 @@ class PickPlayerButton(discord.ui.Button):
             self.match_number, self.player_discord_id,
         )
         if not player_row:
-            await interaction.response.send_message("This player is no longer available.", ephemeral=True)
+            await interaction.followup.send("This player is no longer available.", ephemeral=True)
             return
 
         role_pref = player_row["role_pref"]
@@ -1517,7 +1541,7 @@ class PickPlayerButton(discord.ui.Button):
         current_role_count = await count_team_role(self.match_number, captain_side, role_pref)
 
         if current_role_count >= max_role_count:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Your team already has the maximum number of {role_label(role_pref)}s.",
                 ephemeral=True
             )
@@ -1539,7 +1563,7 @@ class PickPlayerButton(discord.ui.Button):
             )
             final_match = await get_match_by_number(self.match_number)
 
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 embed=await build_ready_embed(interaction.guild, final_match),
                 view=StartMatchView(self.cog, self.match_number)
             )
@@ -1547,7 +1571,7 @@ class PickPlayerButton(discord.ui.Button):
 
         updated = await get_match_by_number(self.match_number)
         options = await get_available_players(self.match_number)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=await build_draft_embed(interaction.guild, updated),
             view=DraftView(self.cog, self.match_number, options)
         )
@@ -1596,19 +1620,24 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             await interaction.response.send_message("Only Match Organizer can start the match.", ephemeral=True)
             return
 
+        # Creating three Discord channels below (one text + two voice)
+        # plus several DB round-trips easily takes well over 3 seconds -
+        # ack immediately.
+        await interaction.response.defer()
+
         match_row = await get_match_by_number(self.match_number)
         if not match_row or match_row["status"] != "ready_to_start":
-            await interaction.response.send_message("This match is not ready to be started.", ephemeral=True)
+            await interaction.followup.send("This match is not ready to be started.", ephemeral=True)
             return
 
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Guild not found.", ephemeral=True)
+            await interaction.followup.send("Guild not found.", ephemeral=True)
             return
 
         category = guild.get_channel(MATCHMAKING_CATEGORY_ID)
         if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message("Matchmaking category not found.", ephemeral=True)
+            await interaction.followup.send("Matchmaking category not found.", ephemeral=True)
             return
 
         match_organizer_role = guild.get_role(MATCH_ORGANIZER_ROLE_ID)
@@ -1746,7 +1775,7 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             view=view
         )
 
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=await build_match_started_embed(guild, updated),
             view=view
         )
@@ -1817,9 +1846,13 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
             await interaction.response.send_message("Only Match Organizer can replace players.", ephemeral=True)
             return
 
+        # Replacing a player chains several DB round-trips plus multiple
+        # Discord channel-permission edits - ack immediately.
+        await interaction.response.defer(ephemeral=True)
+
         match_row = await get_match_by_number(self.match_number)
         if not match_row or match_row["status"] != "in_progress":
-            await interaction.response.send_message("This match is not in progress.", ephemeral=True)
+            await interaction.followup.send("This match is not in progress.", ephemeral=True)
             return
 
         raw = str(self.new_player).strip()
@@ -1834,11 +1867,11 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
                 new_member = interaction.guild.get_member(int(raw))
 
         if not new_member:
-            await interaction.response.send_message("Could not find that member in this server.", ephemeral=True)
+            await interaction.followup.send("Could not find that member in this server.", ephemeral=True)
             return
 
         if await is_user_busy(new_member.id):
-            await interaction.response.send_message("This player is already in another active queue/match.", ephemeral=True)
+            await interaction.followup.send("This player is already in another active queue/match.", ephemeral=True)
             return
 
         old_row = await database.fetchone(
@@ -1846,7 +1879,7 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
             self.match_number, self.old_discord_id,
         )
         if not old_row:
-            await interaction.response.send_message("Old player not found in this match.", ephemeral=True)
+            await interaction.followup.send("Old player not found in this match.", ephemeral=True)
             return
 
         season_number = match_row["season_number"]
@@ -1854,7 +1887,7 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
 
         ok, error = await replace_match_player(self.match_number, old_discord_id_int, new_member.id)
         if not ok:
-            await interaction.response.send_message(error, ephemeral=True)
+            await interaction.followup.send(error, ephemeral=True)
             return
 
         await database.execute(
@@ -1931,7 +1964,7 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
                     except discord.HTTPException:
                         pass
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Player replaced successfully. {mention_or_name(guild, self.old_discord_id)} received `{REPLACE_LEAVE_PENALTY}` ELO.",
             ephemeral=True
         )
@@ -2199,9 +2232,12 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("Only Staff/Admin can start seasons.", ephemeral=True)
             return
 
+        # Up to three sequential DB round-trips follow - ack immediately.
+        await interaction.response.defer()
+
         active = await get_active_season()
         if active:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Season {active['number']} is already active.",
                 ephemeral=True
             )
@@ -2219,7 +2255,7 @@ class MatchmakingCog(commands.Cog):
                 number, now(),
             )
 
-        await interaction.response.send_message(f"Season {number} started successfully.")
+        await interaction.followup.send(f"Season {number} started successfully.")
 
     @season.command(name="end", description="Ends the active Matchmaking season")
     async def season_end(self, interaction: discord.Interaction, number: int):
@@ -2230,9 +2266,12 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("Only Staff/Admin can end seasons.", ephemeral=True)
             return
 
+        # Up to three sequential DB round-trips follow - ack immediately.
+        await interaction.response.defer()
+
         active = await get_active_season()
         if not active or active["number"] != number:
-            await interaction.response.send_message("This season is not the currently active season.", ephemeral=True)
+            await interaction.followup.send("This season is not the currently active season.", ephemeral=True)
             return
 
         active_match = await database.fetchone(
@@ -2243,7 +2282,7 @@ class MatchmakingCog(commands.Cog):
             """
         )
         if active_match:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "There is an active Matchmaking queue/match. Finish or cancel it before ending the season.",
                 ephemeral=True
             )
@@ -2254,13 +2293,16 @@ class MatchmakingCog(commands.Cog):
             now(), number,
         )
 
-        await interaction.response.send_message(f"Season {number} ended successfully.")
+        await interaction.followup.send(f"Season {number} ended successfully.")
 
     @season.command(name="stats", description="Shows season stats")
     async def season_stats(self, interaction: discord.Interaction, number: int):
+        # Three sequential DB round-trips follow - ack immediately.
+        await interaction.response.defer()
+
         season_row = await database.fetchone("SELECT * FROM mm_seasons WHERE number = $1", number)
         if not season_row:
-            await interaction.response.send_message("Season not found.", ephemeral=True)
+            await interaction.followup.send("Season not found.", ephemeral=True)
             return
 
         top_rows = await database.fetchall(
@@ -2318,7 +2360,7 @@ class MatchmakingCog(commands.Cog):
             inline=False
         )
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @mm.command(name="start", description="Starts a Matchmaking queue")
     async def mm_start(self, interaction: discord.Interaction, number: int):
@@ -2329,9 +2371,18 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("Only Match Organizer can use this command.", ephemeral=True)
             return
 
+        # Everything below does several sequential database round-trips
+        # (and sometimes more, e.g. when clearing a cancelled match), which
+        # can add up to more than Discord's 3-second interaction window -
+        # especially with the bot on Discloud talking to Supabase over the
+        # network. Acknowledge immediately and use followups from here on
+        # so Discord never shows "The application did not respond" even
+        # though the match was actually created successfully.
+        await interaction.response.defer()
+
         season_row = await get_active_season()
         if not season_row:
-            await interaction.response.send_message("There is no active season. Use /season start first.", ephemeral=True)
+            await interaction.followup.send("There is no active season. Use /season start first.", ephemeral=True)
             return
 
         existing = await get_match_by_number(number)
@@ -2340,7 +2391,7 @@ class MatchmakingCog(commands.Cog):
                 await database.execute("DELETE FROM mm_match_players WHERE match_number = $1", number)
                 await database.execute("DELETE FROM mm_matches WHERE match_number = $1", number)
             else:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"Match #{number} already exists with status `{existing['status']}`.",
                     ephemeral=True
                 )
@@ -2364,12 +2415,12 @@ class MatchmakingCog(commands.Cog):
         view = JoinQueueView(self, number)
         await view.refresh_labels()
 
-        await interaction.response.send_message(
+        sent_message = await interaction.followup.send(
             embed=await build_queue_embed(interaction.guild, match_row),
-            view=view
+            view=view,
+            wait=True,
         )
 
-        sent_message = await interaction.original_response()
         await database.execute(
             "UPDATE mm_matches SET queue_message_id = $1 WHERE match_number = $2",
             database.did(sent_message.id), number,
@@ -2495,6 +2546,9 @@ class MatchmakingCog(commands.Cog):
     async def mm_elo(self, interaction: discord.Interaction, member: discord.Member | None = None):
         target = member or interaction.user
 
+        # Up to five sequential DB round-trips follow - ack immediately.
+        await interaction.response.defer()
+
         await ensure_mm_player(target.id)
         row = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(target.id))
         season_row = await get_active_season()
@@ -2533,7 +2587,7 @@ class MatchmakingCog(commands.Cog):
                     inline=False
                 )
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     async def finalize_match(
         self,
@@ -2693,6 +2747,9 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("Page must be 1 or greater.", ephemeral=True)
             return
 
+        # Two sequential DB round-trips follow - ack immediately.
+        await interaction.response.defer()
+
         per_page = 10
         offset = (page - 1) * per_page
         guild = interaction.guild
@@ -2748,7 +2805,7 @@ class MatchmakingCog(commands.Cog):
             color=discord.Color.gold()
         )
         embed.set_footer(text=f"Page {page}")
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
 
     @mm.command(name="vip", description="Shows Matchmaking VIP/VIP+ pricing and benefits")
@@ -2887,6 +2944,10 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("ELO must be greater than 0.", ephemeral=True)
             return
 
+        # adjust_player_elo_only alone can chain up to five DB round-trips -
+        # ack immediately.
+        await interaction.response.defer(ephemeral=True)
+
         season_row = await get_active_season()
         season_number = season_row["number"] if season_row else None
 
@@ -2894,7 +2955,7 @@ class MatchmakingCog(commands.Cog):
         row = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(user.id))
         await upsert_profile_from_member(user)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Added `{elo}` ELO to {user.mention}. New ELO: `{row['elo']}`",
             ephemeral=True
         )
@@ -2913,6 +2974,10 @@ class MatchmakingCog(commands.Cog):
             await interaction.response.send_message("ELO must be greater than 0.", ephemeral=True)
             return
 
+        # adjust_player_elo_only alone can chain up to five DB round-trips -
+        # ack immediately.
+        await interaction.response.defer(ephemeral=True)
+
         season_row = await get_active_season()
         season_number = season_row["number"] if season_row else None
 
@@ -2920,7 +2985,7 @@ class MatchmakingCog(commands.Cog):
         row = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(user.id))
         await upsert_profile_from_member(user)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Removed `{elo}` ELO from {user.mention}. New ELO: `{row['elo']}`",
             ephemeral=True
         )
