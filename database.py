@@ -1,7 +1,7 @@
 """
-Database access layer for CVR South America.
+Database access layer for National Volleyball League.
 
-Replaces the old SQLite (savl.db) local file. The bot now talks
+Replaces the old SQLite (nvl.db) local file. The bot now talks
 directly to the same Supabase Postgres database the site uses, via a
 plain Postgres connection (asyncpg) - no local "shadow" copy, no
 sync bridge. There is exactly one source of truth per table.

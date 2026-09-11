@@ -165,7 +165,7 @@ def build_captain_changed_embed(
         ),
         color=discord.Color.gold()
     )
-    embed.set_footer(text="CVR SA Team System")
+    embed.set_footer(text="NVL Team System")
     return embed
 
 
@@ -183,7 +183,7 @@ def build_staff_add_embed(
         ),
         color=discord.Color.green()
     )
-    embed.set_footer(text="CVR SA Team System")
+    embed.set_footer(text="NVL Team System")
     return embed
 
 
@@ -200,7 +200,7 @@ def build_staff_remove_embed(
         ),
         color=discord.Color.red()
     )
-    embed.set_footer(text="CVR SA Team System")
+    embed.set_footer(text="NVL Team System")
     return embed
 
 
@@ -219,7 +219,7 @@ def build_release_embed(requester: discord.Member, player: discord.Member, team_
         ),
         color=discord.Color.dark_gray()
     )
-    embed.set_footer(text="CVR SA Services")
+    embed.set_footer(text="NVL Services")
     return embed
 
 
@@ -233,7 +233,7 @@ def build_pending_transfer_embed(requester: discord.Member, player: discord.Memb
     )
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
-    embed.set_footer(text="CVR SA Services")
+    embed.set_footer(text="NVL Services")
     return embed
 
 
@@ -249,7 +249,7 @@ def build_success_transfer_embed(requester: discord.Member, player: discord.Memb
     )
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
-    embed.set_footer(text="CVR SA Services")
+    embed.set_footer(text="NVL Services")
     return embed
 
 
@@ -265,7 +265,7 @@ def build_denied_transfer_embed(requester: discord.Member, player: discord.Membe
     )
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
-    embed.set_footer(text="CVR SA Services")
+    embed.set_footer(text="NVL Services")
     return embed
 
 
@@ -287,7 +287,7 @@ def build_cleared_transfer_embed(
     )
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
-    embed.set_footer(text="CVR SA Services")
+    embed.set_footer(text="NVL Services")
     return embed
 
 
@@ -301,7 +301,7 @@ def build_team_deleted_embed(requester: discord.Member, team_name: str, captain:
         ),
         color=discord.Color.red()
     )
-    embed.set_footer(text="CVR SA Team System")
+    embed.set_footer(text="NVL Team System")
     return embed
 
 
@@ -705,7 +705,7 @@ class TeamCog(commands.Cog):
             value="\n".join(player_list) if player_list else "None",
             inline=False
         )
-        embed.set_footer(text="CVR SA Team System")
+        embed.set_footer(text="NVL Team System")
 
         await interaction.followup.send(embed=embed)
 

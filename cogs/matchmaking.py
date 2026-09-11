@@ -497,7 +497,7 @@ async def build_queue_embed(guild: discord.Guild | None, match_row):
 
     embed = discord.Embed(
         title=(
-            f"CVR SA Matchmaking Queue #{match_row['match_number']}"
+            f"NVL Matchmaking Queue #{match_row['match_number']}"
             + (" • VIP Queue (2x ELO on wins)" if vip_queue else "")
         ),
         description=build_queue_sections(grouped),
@@ -505,7 +505,7 @@ async def build_queue_embed(guild: discord.Guild | None, match_row):
     )
 
     season = await get_active_season()
-    embed.set_footer(text=f"CVR SA Matchmaking • Season {season['number']}" if season else "CVR SA Matchmaking")
+    embed.set_footer(text=f"NVL Matchmaking • Season {season['number']}" if season else "NVL Matchmaking")
     return embed
 
 
@@ -660,7 +660,7 @@ async def build_match_started_embed(guild: discord.Guild | None, match_row):
         )
 
     embed.set_footer(
-        text="CVR SA Matchmaking • VIP Queue (2x ELO on wins)" if is_vip_queue(match_row) else "CVR SA Matchmaking"
+        text="NVL Matchmaking • VIP Queue (2x ELO on wins)" if is_vip_queue(match_row) else "NVL Matchmaking"
     )
     return embed
 
@@ -699,7 +699,7 @@ async def build_result_embed(guild: discord.Guild | None, match_row):
         inline=False
     )
     embed.set_footer(
-        text="CVR SA Matchmaking Results • VIP Queue (2x ELO on wins)" if is_vip_queue(match_row) else "CVR SA Matchmaking Results"
+        text="NVL Matchmaking Results • VIP Queue (2x ELO on wins)" if is_vip_queue(match_row) else "NVL Matchmaking Results"
     )
     return embed
 
@@ -787,11 +787,11 @@ async def build_cancelled_embed(guild: discord.Guild | None, match_row, cancelle
         description += f"\n**Cancelled by:** {mention_or_name(guild, cancelled_by_id)}"
 
     embed = discord.Embed(
-        title=f"CVR SA Matchmaking Queue #{match_row['match_number']} • Cancelled",
+        title=f"NVL Matchmaking Queue #{match_row['match_number']} • Cancelled",
         description=description,
         color=discord.Color.red()
     )
-    embed.set_footer(text="CVR SA Matchmaking")
+    embed.set_footer(text="NVL Matchmaking")
     return embed
 
 
@@ -2813,9 +2813,9 @@ class MatchmakingCog(commands.Cog):
         my_vip = await vip_data.get_active_vip(interaction.user.id)
 
         embed = discord.Embed(
-            title="CVR SA Matchmaking — VIP & VIP+",
+            title="NVL Matchmaking — VIP & VIP+",
             description=(
-                f"Buy it on the site: {config.CVR_SA_SITE_URL}/matchmaking#vip\n"
+                f"Buy it on the site: {config.NVL_SITE_URL}/matchmaking#vip\n"
                 "Payment via Pix, processed by Stripe. Valid for "
                 f"{vip_data.VIP_DURATION_DAYS} days from confirmation."
             ),

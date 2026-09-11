@@ -197,7 +197,7 @@ class MatchCog(commands.Cog):
             inline=False
         )
 
-        embed.set_footer(text="CVR SA Services")
+        embed.set_footer(text="NVL Services")
 
         await interaction.channel.send(embed=embed)
         await interaction.followup.send("Result posted successfully.", ephemeral=True)

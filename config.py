@@ -12,7 +12,7 @@ SCRIM_CHANNEL_ID = int(os.getenv("SCRIM_CHANNEL_ID", "0"))
 
 CAPTAIN_ROLE_ID = int(os.getenv("CAPTAIN_ROLE_ID", "0"))
 VICE_CAPTAIN_ROLE_ID = int(os.getenv("VICE_CAPTAIN_ROLE_ID", "0"))
-# New for CVR SA: Court Captain has the exact same permissions as Vice
+# New for NVL: Court Captain has the exact same permissions as Vice
 # Captain everywhere in the bot (team management commands, roster
 # checks, etc). A team can have a Vice Captain AND a Court Captain
 # at the same time.
@@ -35,7 +35,7 @@ STAFF_APPROVER_ROLE_IDS = [
 MATCH_ORGANIZER_ROLE_ID = int(os.getenv("MATCH_ORGANIZER_ROLE_ID", "0"))
 MATCHMAKING_CATEGORY_ID = int(os.getenv("MATCHMAKING_CATEGORY_ID", "0"))
 MM_RESULTS_CHANNEL_ID = int(os.getenv("MM_RESULTS_CHANNEL_ID", "0"))
-# Bugfix carried over from the SAVL source project: this was never wired
+# Bugfix carried over from the NVL source project: this was never wired
 # to an env var there, so it silently always fell back to a hardcoded
 # old-server channel ID. Fixed here - set it in your .env.
 ELO_UPDATE_CHANNEL_ID = int(os.getenv("ELO_UPDATE_CHANNEL_ID", "0"))
@@ -43,7 +43,7 @@ ELO_UPDATE_CHANNEL_ID = int(os.getenv("ELO_UPDATE_CHANNEL_ID", "0"))
 # ------------------------------------------------------------
 # Database (Supabase Postgres)
 # ------------------------------------------------------------
-# CVR SA no longer keeps a local SQLite file. The bot connects
+# NVL no longer keeps a local SQLite file. The bot connects
 # directly to the same Supabase Postgres database the site uses, via
 # a plain Postgres connection string (asyncpg) rather than the REST
 # API. Use Supabase's "Session pooler" connection string (Database
@@ -60,5 +60,5 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 VIP_ROLE_ID = int(os.getenv("VIP_ROLE_ID", "0"))
 VIP_PLUS_ROLE_ID = int(os.getenv("VIP_PLUS_ROLE_ID", "0"))
 
-# Used to build "buy VIP" links in Discord embeds (e.g. https://cvr-sa-site.vercel.app).
-CVR_SA_SITE_URL = os.getenv("CVR_SA_SITE_URL", "https://cvr-sa-site.vercel.app").rstrip("/")
+# Used to build "buy VIP" links in Discord embeds (e.g. https://nvl-site.vercel.app).
+NVL_SITE_URL = os.getenv("NVL_SITE_URL", "https://nvl-site.vercel.app").rstrip("/")

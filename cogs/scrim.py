@@ -45,7 +45,7 @@ async def scrim_command(
         f"from {interaction.user.mention}\n"
         f"Request: **{scrim_type.value}**"
     )
-    embed.set_footer(text="CVR SA Services")
+    embed.set_footer(text="NVL Services")
 
     await interaction.response.defer()
     await interaction.followup.send(
