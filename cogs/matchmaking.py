@@ -69,9 +69,9 @@ SPECIAL_MATCH_CHANCE     = 0.20
 SPECIAL_MATCH_MULTIPLIER = 3
 SPECIAL_MATCH_NAME       = "🏆 GOLDEN MATCH"
 
-# How long to wait before pushing a queue embed update (debounce window).
-# If multiple players click within this window, only ONE edit is sent.
-DEBOUNCE_SECONDS = 0.3
+# Debounce window for queue embed updates.
+# Multiple clicks within this window collapse into one Discord API call.
+DEBOUNCE_SECONDS = 0.4
 
 
 # ============================================================
@@ -133,8 +133,7 @@ def format_delta(d: int) -> str:
 
 
 # ============================================================
-# DB HELPERS  — all take an explicit asyncpg.Connection
-# so the caller controls how many pool slots are used.
+# DB HELPERS — all take an explicit asyncpg.Connection
 # ============================================================
 
 async def _q(c, query, *p):
@@ -217,7 +216,7 @@ async def db_turn_side(c, match_row) -> str | None:
     avail = await db_get_available(c, match_row["match_number"])
     if not avail:
         return None
-    picks = await db_pick_count(c, match_row["match_number"])
+    picks  = await db_pick_count(c, match_row["match_number"])
     first  = "A" if match_row["first_picker_discord_id"] == match_row["captain1_discord_id"] else "B"
     second = "B" if first == "A" else "A"
     return first if picks % 2 == 0 else second
@@ -262,10 +261,10 @@ def parse_score(text: str):
     if not raw:
         return None, "Final Score cannot be empty."
     parts = [p.strip() for p in re.split(r"[,|\n;]+", raw) if p.strip()]
-    sets = []
+    sets  = []
     for part in parts:
         norm = re.sub(r"\s*[xX:]\s*", "-", part)
-        m = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", norm)
+        m    = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", norm)
         if not m:
             return None, "Invalid score format. Example: `25-20, 22-25, 15-11`"
         a, b = int(m.group(1)), int(m.group(2))
@@ -299,7 +298,7 @@ def calc_elo_deltas(sets, winner_side: str):
 
 
 # ============================================================
-# EMBED BUILDERS  (pure, no DB calls)
+# EMBED BUILDERS — pure, no DB calls
 # ============================================================
 
 def _queue_sections(guild, rows) -> str:
@@ -320,7 +319,7 @@ def _queue_sections(guild, rows) -> str:
 
 def embed_queue(guild, match_row, rows) -> discord.Embed:
     vq = is_vip_queue(match_row)
-    e = discord.Embed(
+    e  = discord.Embed(
         title=(
             f"NVL Matchmaking Queue #{match_row['match_number']}"
             + (" • VIP Queue (2x ELO on wins)" if vq else "")
@@ -357,7 +356,7 @@ def embed_captains(guild, match_row, all_rows) -> discord.Embed:
         lines.append(f"{mention(guild, row['discord_id'])}`{suf}`")
     c1 = mention(guild, match_row["captain1_discord_id"]) if match_row["captain1_discord_id"] else "Not selected"
     c2 = mention(guild, match_row["captain2_discord_id"]) if match_row["captain2_discord_id"] else "Not selected"
-    e = discord.Embed(
+    e  = discord.Embed(
         title=f"Queue #{match_row['match_number']} • Set Captains",
         description=(
             "The queue is now full.\n\n**Queued Players**\n"
@@ -490,7 +489,7 @@ def embed_cancelled_ip(guild, match_row, team_a, team_b, by_id=None) -> discord.
 
 
 # ============================================================
-# ELO UPDATE
+# ELO
 # ============================================================
 
 async def apply_elo(c, discord_id: str, season: int | None, delta: int,
@@ -549,24 +548,26 @@ async def adjust_elo_only(c, discord_id: str, season: int | None, delta: int):
 # ============================================================
 # QUEUE MESSAGE UPDATER
 #
-# The core idea: decouple "state change" from "Discord edit".
+# Solves the "N clicks → N Discord edits" problem.
 #
-# When multiple players click within DEBOUNCE_SECONDS of each other,
-# only ONE Discord API call is made — with the latest state.
-# This eliminates rate-limit pressure and the "10 edits for 10 clicks"
-# problem identified in the architecture review.
+# Architecture:
+#   - One QueueUpdater per active match, owned by MMCog.
+#   - State machine: IDLE → DIRTY (scheduled) → IDLE (after push).
+#   - Uses an asyncio.Event + persistent loop task instead of
+#     cancel/recreate, which is more robust and avoids task leaks.
+#   - The push always reads fresh state from DB, so it never sends
+#     a stale embed even if several changes happened during the window.
+#   - Always sends embed + the correct view together, fixing the
+#     "buttons disappear" bug from the previous version.
 # ============================================================
 
 class QueueUpdater:
     """
-    Per-queue debounced embed updater.
+    Debounced queue embed pusher.
 
-    Usage:
-        updater = QueueUpdater(bot, match_number, channel_id, message_id)
-        updater.schedule(guild)   # call this after every state change
-
-    The first call starts a timer. Further calls within DEBOUNCE_SECONDS
-    reset the timer. When the timer fires, ONE embed edit is sent.
+    Call .mark_dirty(guild, view) after every state change.
+    The updater waits DEBOUNCE_SECONDS after the *last* call,
+    then reads fresh state from DB and pushes one edit.
     """
 
     def __init__(self, bot: commands.Bot, mn: int,
@@ -575,20 +576,59 @@ class QueueUpdater:
         self.mn         = mn
         self.channel_id = channel_id
         self.message_id = message_id
-        self._task: asyncio.Task | None = None
 
-    def schedule(self, guild: discord.Guild | None) -> None:
-        """Schedule (or reschedule) a debounced embed update."""
-        if self._task and not self._task.done():
+        self._dirty   = asyncio.Event()
+        self._guild:  discord.Guild | None = None
+        self._view:   discord.ui.View | None = None
+        self._stopped = False
+        self._task    = asyncio.create_task(self._loop())
+
+    def mark_dirty(self, guild: discord.Guild | None,
+                   view: discord.ui.View | None) -> None:
+        """
+        Signal that the queue state changed and a push is needed.
+        Calling this multiple times within DEBOUNCE_SECONDS results
+        in exactly one push with the most recent guild/view.
+        """
+        if self._stopped:
+            return
+        self._guild = guild
+        self._view  = view
+        self._dirty.set()
+
+    def stop(self) -> None:
+        """Cancel the background loop (call when match ends/cancels)."""
+        self._stopped = True
+        self._dirty.set()   # wake loop so it can exit cleanly
+        if not self._task.done():
             self._task.cancel()
-        self._task = asyncio.create_task(self._debounced_push(guild))
 
-    async def _debounced_push(self, guild: discord.Guild | None) -> None:
-        await asyncio.sleep(DEBOUNCE_SECONDS)
-        await self._push(guild)
+    async def _loop(self) -> None:
+        while not self._stopped:
+            # Wait until someone marks us dirty.
+            await self._dirty.wait()
+            if self._stopped:
+                break
 
-    async def _push(self, guild: discord.Guild | None) -> None:
-        """Read latest state from DB and edit the message once."""
+            # Debounce: reset the event and wait. If more changes arrive
+            # during the sleep they set the event again; we loop back and
+            # wait the full window from the new signal.
+            self._dirty.clear()
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+
+            # If marked dirty again during sleep, go back and wait more.
+            if self._dirty.is_set():
+                continue
+
+            # Push the update with the latest guild/view snapshot.
+            await self._push(self._guild, self._view)
+
+    async def _push(self, guild: discord.Guild | None,
+                    view: discord.ui.View | None) -> None:
+        """
+        Read fresh state from DB and edit the queue message.
+        Always sends embed + view together so buttons never disappear.
+        """
         try:
             async with database.conn() as c:
                 match_row = await db_get_match(c, self.mn)
@@ -600,28 +640,37 @@ class QueueUpdater:
                 if status == "queue_open":
                     rows = await db_get_queue_rows(c, self.mn)
                     emb  = embed_queue(guild, match_row, rows)
-                    view = None  # keep existing view (buttons stay)
+                    # view is the JoinQueueView passed by the caller
                 elif status == "captains_pending":
                     all_rows = await db_get_queue_rows(c, self.mn)
-                    emb  = embed_captains(guild, match_row, all_rows)
-                    view = None
+                    emb      = embed_captains(guild, match_row, all_rows)
+                    # view is the CaptainSetupView passed by the caller
                 elif status == "draft":
                     team_a = await db_get_team(c, self.mn, "A")
                     team_b = await db_get_team(c, self.mn, "B")
                     avail  = await db_get_available(c, self.mn)
                     turn   = await db_turn_side(c, match_row)
                     emb    = embed_draft(guild, match_row, team_a, team_b, avail, turn)
-                    view   = None
+                    # view is the DraftView passed by the caller
                 else:
+                    # team_format_vote or anything else:
+                    # the vote view manages its own edits; skip.
                     return
 
             channel = self.bot.get_channel(self.channel_id)
             if not isinstance(channel, discord.TextChannel):
                 return
             msg = channel.get_partial_message(self.message_id)
-            await msg.edit(embed=emb)
 
-        except (discord.HTTPException, Exception):
+            # Always include the view so buttons are never lost.
+            edit_kwargs: dict = {"embed": emb}
+            if view is not None:
+                edit_kwargs["view"] = view
+            await msg.edit(**edit_kwargs)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             pass  # best-effort; never crash the bot
 
 
@@ -633,12 +682,14 @@ class JoinQueueView(discord.ui.View):
     """
     Queue join/leave buttons.
 
-    Design choices:
-    - custom_ids are fixed in __init__ (not in callbacks) so Discord
-      can route interactions correctly after bot restarts.
-    - The lock only protects the atomic DB write; the embed update is
-      handed off to QueueUpdater (debounced) so many clicks → 1 edit.
-    - Each interaction is ACK'd with defer() before any DB work.
+    Concurrency model:
+    - custom_ids set in __init__ (not callbacks) for correct routing.
+    - Lock protects ONLY the DB write (INSERT + status check).
+      VIP is fetched BEFORE acquiring the lock (separate pool slot).
+      Discord followup is sent AFTER releasing the lock.
+    - Embed update is debounced via QueueUpdater: many clicks → 1 edit.
+    - Transition to team_format_vote is also handled inside the lock
+      to ensure exactly one interaction triggers the status change.
     """
 
     def __init__(self, cog: "MMCog", match_number: int):
@@ -646,7 +697,6 @@ class JoinQueueView(discord.ui.View):
         self.cog = cog
         self.mn  = match_number
 
-        # Overwrite placeholder custom_ids with real, stable ids.
         _map = {
             "q_s":  f"mm_s_{match_number}",
             "q_oh": f"mm_oh_{match_number}",
@@ -658,7 +708,8 @@ class JoinQueueView(discord.ui.View):
             if isinstance(item, discord.ui.Button) and item.custom_id in _map:
                 item.custom_id = _map[item.custom_id]
 
-    def _update_button_labels(self, counts: dict[str, int]) -> None:
+    def _update_labels(self, counts: dict[str, int]) -> None:
+        """Update button labels in-memory (the updater will push the embed)."""
         for item in self.children:
             if not isinstance(item, discord.ui.Button):
                 continue
@@ -670,116 +721,124 @@ class JoinQueueView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        # ACK immediately — nothing before this await.
+        # ① ACK immediately — before ANY other work.
         await interaction.response.defer(ephemeral=True)
 
-        uid  = database.did(interaction.user.id)
+        uid = database.did(interaction.user.id)
+
+        # ② Fetch VIP status BEFORE the lock.
+        # This uses its own pool connection and must not be inside the lock,
+        # which would block other players while this round-trip completes.
+        vip = await vip_data.get_active_vip(interaction.user.id)
+
+        # ③ Lock: only the minimum critical section.
+        # Covers: state validation + INSERT + queue-full check.
+        # Does NOT cover: VIP fetch (above), followup send (below),
+        # or embed update (via updater, completely outside).
         lock = self.cog.get_lock(self.mn)
 
-        # ── CRITICAL SECTION: just the DB write ──────────────────────
-        # The lock only wraps the minimum necessary: checking state and
-        # inserting the player. The embed update happens OUTSIDE the lock
-        # via the debounced QueueUpdater.
-        async with lock:
-            # VIP fetched before entering conn() — it uses its own pool slot.
-            vip = await vip_data.get_active_vip(interaction.user.id)
+        error_msg: str | None = None
+        joined      = False
+        went_full   = False
+        counts:  dict[str, int] = {}
+        total_after = 0
 
+        async with lock:
             async with database.conn() as c:
                 match_row = await db_get_match(c, self.mn)
+
                 if not match_row or match_row["status"] != "queue_open":
-                    await interaction.followup.send("This queue is no longer open.", ephemeral=True)
-                    return
+                    error_msg = "This queue is no longer open."
+                elif await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2", self.mn, uid):
+                    error_msg = "You are already in this queue."
+                elif await db_is_busy(c, uid):
+                    error_msg = "You are already in another active queue/match."
+                else:
+                    is_vip_plus = bool(vip and vip["tier"] == "vip_plus")
+                    rc_row      = await _q(c, "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1 AND role_pref=$2", self.mn, role)
+                    role_count  = rc_row["n"] if rc_row else 0
 
-                existing = await _q(c,
-                    "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2",
-                    self.mn, uid)
-                if existing:
-                    await interaction.followup.send("You are already in this queue.", ephemeral=True)
-                    return
+                    if role_count >= ROLE_MAX_TOTAL[role]:
+                        if not is_vip_plus:
+                            error_msg = f"The {ROLE_LABELS[role]} slot is full."
+                        else:
+                            tot_row = await _q(c, "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1", self.mn)
+                            if (tot_row["n"] if tot_row else 0) >= QUEUE_SIZE:
+                                error_msg = "This queue is already full."
 
-                if await db_is_busy(c, uid):
-                    await interaction.followup.send("You are already in another active queue/match.", ephemeral=True)
-                    return
+                    if error_msg is None:
+                        weight = vip_data.VIP_CAPTAIN_PRIORITY_WEIGHT.get(vip["tier"], 0) if vip else 0
+                        try:
+                            await _x(c, """
+                                INSERT INTO mm_match_players
+                                    (match_number, discord_id, role_pref, team_side, captain, pick_order, priority_weight)
+                                VALUES ($1, $2, $3, NULL, false, NULL, $4)
+                                """, self.mn, uid, role, weight)
+                            joined = True
+                        except asyncpg.UniqueViolationError:
+                            error_msg = "You have already joined this queue."
 
-                is_vip_plus = bool(vip and vip["tier"] == "vip_plus")
-                rc_row = await _q(c,
-                    "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1 AND role_pref=$2",
-                    self.mn, role)
-                role_count = rc_row["n"] if rc_row else 0
+                if joined:
+                    # Check queue-full transition atomically (still inside lock).
+                    tot_row     = await _q(c, "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1", self.mn)
+                    total_after = tot_row["n"] if tot_row else 0
 
-                if role_count >= ROLE_MAX_TOTAL[role]:
-                    if not is_vip_plus:
-                        await interaction.followup.send(f"The {ROLE_LABELS[role]} slot is full.", ephemeral=True)
-                        return
-                    total_row = await _q(c,
-                        "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1",
-                        self.mn)
-                    if (total_row["n"] if total_row else 0) >= QUEUE_SIZE:
-                        await interaction.followup.send("This queue is already full.", ephemeral=True)
-                        return
+                    if total_after >= QUEUE_SIZE and match_row["status"] == "queue_open":
+                        await _x(c,
+                            "UPDATE mm_matches SET status='team_format_vote' WHERE match_number=$1 AND status='queue_open'",
+                            self.mn)
+                        went_full = True
+                    else:
+                        # Collect counts for label update (only for normal joins).
+                        rows = await db_get_queue_rows(c, self.mn)
+                        for r in rows:
+                            if r["role_pref"] in counts:
+                                counts[r["role_pref"]] = counts.get(r["role_pref"], 0) + 1
+                            else:
+                                counts[r["role_pref"]] = 1
 
-                weight = vip_data.VIP_CAPTAIN_PRIORITY_WEIGHT.get(vip["tier"], 0) if vip else 0
+        # ④ All Discord I/O happens OUTSIDE the lock.
+
+        if error_msg:
+            await interaction.followup.send(error_msg, ephemeral=True)
+            return
+
+        if went_full:
+            # Queue hit 12 — switch to vote phase.
+            # Build the VoteView and push it via the updater channel
+            # (no fetch_message needed; we have channel_id + message_id).
+            vv      = VoteView(self.cog, self.mn, total_after)
+            updater = self.cog.get_updater(self.mn)
+
+            if updater:
+                # Stop the debounce loop — vote view handles its own edits.
+                updater.stop()
+                self.cog.clear_updater(self.mn)
 
                 try:
-                    await _x(c, """
-                        INSERT INTO mm_match_players
-                            (match_number, discord_id, role_pref, team_side, captain, pick_order, priority_weight)
-                        VALUES ($1, $2, $3, NULL, false, NULL, $4)
-                        """, self.mn, uid, role, weight)
-                except asyncpg.UniqueViolationError:
-                    await interaction.followup.send("You have already joined this queue.", ephemeral=True)
-                    return
+                    channel = self.bot.get_channel(updater.channel_id)
+                    if isinstance(channel, discord.TextChannel):
+                        # We need the Message object so VoteView can edit it later.
+                        async with database.conn() as c:
+                            mr = await db_get_match(c, self.mn)
+                        emb = embed_vote(mr, 0, 0, 0, total_after)
+                        msg = await channel.fetch_message(updater.message_id)
+                        await msg.edit(embed=emb, view=vv)
+                        vv.message = msg
+                except discord.HTTPException:
+                    pass
 
-                # Check if queue is now full — transition inside the lock
-                # so only one interaction triggers the status change.
-                total_row = await _q(c,
-                    "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1",
-                    self.mn)
-                total = total_row["n"] if total_row else 0
+            self.cog.set_vote_view(self.mn, vv)
+            asyncio.create_task(upsert_profile_from_member(interaction.user))
+            await interaction.followup.send(
+                "✅ You joined! Queue is now full — vote above.", ephemeral=True)
+            return
 
-                if total >= QUEUE_SIZE and match_row["status"] == "queue_open":
-                    await _x(c,
-                        "UPDATE mm_matches SET status='team_format_vote' WHERE match_number=$1 AND status='queue_open'",
-                        self.mn)
-                    # Fetch updated match row to build vote view
-                    match_row = await db_get_match(c, self.mn)
-                    all_rows  = await db_get_queue_rows(c, self.mn)
-
-                    if match_row["status"] == "team_format_vote":
-                        # Build & send the vote embed immediately via followup
-                        # (the queue message itself stays intact as context)
-                        vv  = VoteView(self.cog, self.mn, total)
-                        emb = embed_vote(match_row, 0, 0, 0, total)
-
-                        updater = self.cog.get_updater(self.mn)
-                        if updater:
-                            try:
-                                channel = interaction.guild.get_channel(updater.channel_id) if interaction.guild else None
-                                if isinstance(channel, discord.TextChannel):
-                                    msg = await channel.fetch_message(updater.message_id)
-                                    await msg.edit(embed=emb, view=vv)
-                                    vv.message = msg
-                            except discord.HTTPException:
-                                pass
-                        self.cog.set_vote_view(self.mn, vv)
-
-                        await interaction.followup.send("You joined the queue! Queue is now full — vote above.", ephemeral=True)
-                        asyncio.create_task(upsert_profile_from_member(interaction.user))
-                        return
-
-                # Normal join: update button labels and schedule debounced embed update.
-                rows   = await db_get_queue_rows(c, self.mn)
-                counts = {r: 0 for r in ROLE_ORDER}
-                for row in rows:
-                    if row["role_pref"] in counts:
-                        counts[row["role_pref"]] += 1
-
-        # Outside the lock — update button labels and schedule embed push.
-        self._update_button_labels(counts)
-
+        # Normal join: update button labels and schedule debounced push.
+        self._update_labels(counts)
         updater = self.cog.get_updater(self.mn)
         if updater:
-            updater.schedule(interaction.guild)
+            updater.mark_dirty(interaction.guild, self)
 
         asyncio.create_task(upsert_profile_from_member(interaction.user))
         await interaction.followup.send("✅ You joined the queue!", ephemeral=True)
@@ -806,46 +865,60 @@ class JoinQueueView(discord.ui.View):
             return
         await i.response.defer(ephemeral=True)
 
-        uid  = database.did(i.user.id)
-        lock = self.cog.get_lock(self.mn)
+        uid   = database.did(i.user.id)
+        lock  = self.cog.get_lock(self.mn)
+        error_msg: str | None = None
+        counts: dict[str, int] = {}
 
         async with lock:
             async with database.conn() as c:
                 match_row = await db_get_match(c, self.mn)
                 if not match_row or match_row["status"] != "queue_open":
-                    await i.followup.send("This queue is no longer open.", ephemeral=True)
-                    return
-                row = await _q(c,
-                    "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2",
-                    self.mn, uid)
-                if not row:
-                    await i.followup.send("You are not in this queue.", ephemeral=True)
-                    return
-                await _x(c,
-                    "DELETE FROM mm_match_players WHERE match_number=$1 AND discord_id=$2",
-                    self.mn, uid)
-                rows   = await db_get_queue_rows(c, self.mn)
-                counts = {r: 0 for r in ROLE_ORDER}
-                for r in rows:
-                    if r["role_pref"] in counts:
-                        counts[r["role_pref"]] += 1
+                    error_msg = "This queue is no longer open."
+                elif not await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2", self.mn, uid):
+                    error_msg = "You are not in this queue."
+                else:
+                    await _x(c, "DELETE FROM mm_match_players WHERE match_number=$1 AND discord_id=$2", self.mn, uid)
+                    rows = await db_get_queue_rows(c, self.mn)
+                    for r in rows:
+                        counts[r["role_pref"]] = counts.get(r["role_pref"], 0) + 1
 
-        self._update_button_labels(counts)
+        if error_msg:
+            await i.followup.send(error_msg, ephemeral=True)
+            return
+
+        self._update_labels(counts)
         updater = self.cog.get_updater(self.mn)
         if updater:
-            updater.schedule(i.guild)
-
+            updater.mark_dirty(i.guild, self)
         await i.followup.send("You left the queue.", ephemeral=True)
+
+    @property
+    def bot(self) -> commands.Bot:
+        return self.cog.bot
 
 
 # ---------------------------------------------------------------
 
 class VoteView(discord.ui.View):
+    """
+    Random Teams vs Captain Picks vote.
+
+    Concurrency:
+    - self.votes is a dict keyed by discord_id (string).
+      It is only written inside the match lock, so no race condition.
+    - self.resolved is set inside the lock before any async work begins,
+      making double-resolution impossible.
+    - The vote count stored in self.total comes from the DB count at
+      queue-full time and is never mutated, so reading it outside the
+      lock is safe.
+    """
+
     def __init__(self, cog: "MMCog", match_number: int, total: int):
         super().__init__(timeout=30)
-        self.cog     = cog
-        self.mn      = match_number
-        self.total   = total
+        self.cog      = cog
+        self.mn       = match_number
+        self.total    = total
         self.votes:   dict[str, str] = {}
         self.message: discord.Message | None = None
         self.resolved = False
@@ -857,7 +930,7 @@ class VoteView(discord.ui.View):
                 elif item.custom_id == "vc":
                     item.custom_id = f"vc_{match_number}"
 
-    def _tally(self):
+    def _tally(self) -> tuple[int, int]:
         rv = sum(1 for v in self.votes.values() if v == "r")
         cv = sum(1 for v in self.votes.values() if v == "c")
         return rv, cv
@@ -868,6 +941,9 @@ class VoteView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
 
         lock = self.cog.get_lock(self.mn)
+        should_resolve = False
+        emb = None
+
         async with lock:
             if self.resolved:
                 await interaction.followup.send("Voting has already ended.", ephemeral=True)
@@ -878,6 +954,7 @@ class VoteView(discord.ui.View):
                 if not match_row or match_row["status"] != "team_format_vote":
                     await interaction.followup.send("Voting is no longer active.", ephemeral=True)
                     return
+
                 uid     = database.did(interaction.user.id)
                 present = await _q(c,
                     "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2",
@@ -885,22 +962,29 @@ class VoteView(discord.ui.View):
                 if not present:
                     await interaction.followup.send("Only players in this queue can vote.", ephemeral=True)
                     return
+
                 self.votes[uid] = choice
 
                 if len(self.votes) >= self.total:
-                    await self._resolve(interaction.guild, c)
-                    await interaction.followup.send("Vote registered — resolving now.", ephemeral=True)
-                    return
+                    # Mark resolved inside the lock before releasing it,
+                    # so no other coroutine can race to resolve too.
+                    self.resolved = True
+                    should_resolve = True
+                else:
+                    rv, cv = self._tally()
+                    emb = embed_vote(match_row, rv, cv, len(self.votes), self.total)
 
-                rv, cv = self._tally()
-                emb = embed_vote(match_row, rv, cv, len(self.votes), self.total)
-
-        if self.message:
-            try:
-                await self.message.edit(embed=emb, view=self)
-            except discord.HTTPException:
-                pass
-        await interaction.followup.send("Vote registered.", ephemeral=True)
+        # Outside the lock.
+        if should_resolve:
+            await self._do_resolve(interaction.guild)
+            await interaction.followup.send("Vote registered — resolving now.", ephemeral=True)
+        else:
+            if emb and self.message:
+                try:
+                    await self.message.edit(embed=emb, view=self)
+                except discord.HTTPException:
+                    pass
+            await interaction.followup.send("Vote registered.", ephemeral=True)
 
     @discord.ui.button(label="Random Teams",  style=discord.ButtonStyle.success, custom_id="vr")
     async def vote_random(self, i: discord.Interaction, b: discord.ui.Button):
@@ -915,51 +999,54 @@ class VoteView(discord.ui.View):
         async with lock:
             if self.resolved:
                 return
-            guild = self.cog.bot.get_guild(config.GUILD_ID)
-            async with database.conn() as c:
-                await self._resolve(guild, c)
+            self.resolved = True
+        # Outside the lock.
+        guild = self.cog.bot.get_guild(config.GUILD_ID)
+        await self._do_resolve(guild)
 
-    async def _resolve(self, guild, c):
-        """Caller must hold the match lock and pass an open connection."""
-        if self.resolved:
-            return
-        self.resolved = True
+    async def _do_resolve(self, guild: discord.Guild | None) -> None:
+        """
+        Execute the vote result. Must be called with self.resolved = True
+        already set (inside the lock), but runs its DB + Discord work here,
+        outside the lock, to avoid holding the lock during network I/O.
+        """
         self.stop()
         self.cog.clear_vote_view(self.mn)
-
-        match_row = await db_get_match(c, self.mn)
-        if not match_row or match_row["status"] != "team_format_vote":
-            return
 
         rv, cv   = self._tally()
         use_rand = rv > cv
 
-        if use_rand:
-            for role in ROLE_ORDER:
-                players = await _qa(c,
-                    "SELECT discord_id FROM mm_match_players WHERE match_number=$1 AND role_pref=$2",
-                    self.mn, role)
-                ids = [r["discord_id"] for r in players]
-                random.shuffle(ids)
-                half    = len(ids) // 2
-                extra   = bool(len(ids) - 2 * half) and random.random() < 0.5
-                a_count = half + (1 if extra else 0)
-                for d in ids[:a_count]:
-                    await _x(c, "UPDATE mm_match_players SET team_side='A' WHERE match_number=$1 AND discord_id=$2", self.mn, d)
-                for d in ids[a_count:]:
-                    await _x(c, "UPDATE mm_match_players SET team_side='B' WHERE match_number=$1 AND discord_id=$2", self.mn, d)
-            await _x(c, "UPDATE mm_matches SET status='ready_to_start' WHERE match_number=$1", self.mn)
+        async with database.conn() as c:
             match_row = await db_get_match(c, self.mn)
-            team_a    = await db_get_team(c, self.mn, "A")
-            team_b    = await db_get_team(c, self.mn, "B")
-            emb  = embed_ready(guild, match_row, team_a, team_b)
-            view = StartMatchView(self.cog, self.mn)
-        else:
-            await _x(c, "UPDATE mm_matches SET status='captains_pending' WHERE match_number=$1", self.mn)
-            match_row = await db_get_match(c, self.mn)
-            all_rows  = await db_get_queue_rows(c, self.mn)
-            emb  = embed_captains(guild, match_row, all_rows)
-            view = CaptainSetupView(self.cog, self.mn)
+            if not match_row or match_row["status"] != "team_format_vote":
+                return
+
+            if use_rand:
+                for role in ROLE_ORDER:
+                    players = await _qa(c,
+                        "SELECT discord_id FROM mm_match_players WHERE match_number=$1 AND role_pref=$2",
+                        self.mn, role)
+                    ids = [r["discord_id"] for r in players]
+                    random.shuffle(ids)
+                    half    = len(ids) // 2
+                    extra   = bool(len(ids) - 2 * half) and random.random() < 0.5
+                    a_count = half + (1 if extra else 0)
+                    for d in ids[:a_count]:
+                        await _x(c, "UPDATE mm_match_players SET team_side='A' WHERE match_number=$1 AND discord_id=$2", self.mn, d)
+                    for d in ids[a_count:]:
+                        await _x(c, "UPDATE mm_match_players SET team_side='B' WHERE match_number=$1 AND discord_id=$2", self.mn, d)
+                await _x(c, "UPDATE mm_matches SET status='ready_to_start' WHERE match_number=$1", self.mn)
+                match_row = await db_get_match(c, self.mn)
+                team_a    = await db_get_team(c, self.mn, "A")
+                team_b    = await db_get_team(c, self.mn, "B")
+                emb  = embed_ready(guild, match_row, team_a, team_b)
+                view = StartMatchView(self.cog, self.mn)
+            else:
+                await _x(c, "UPDATE mm_matches SET status='captains_pending' WHERE match_number=$1", self.mn)
+                match_row = await db_get_match(c, self.mn)
+                all_rows  = await db_get_queue_rows(c, self.mn)
+                emb  = embed_captains(guild, match_row, all_rows)
+                view = CaptainSetupView(self.cog, self.mn)
 
         if self.message:
             try:
@@ -1005,19 +1092,23 @@ class CaptainSelect(discord.ui.Select):
         await interaction.response.defer(ephemeral=True)
 
         lock = self.cog.get_lock(self.mn)
+        both_set  = False
+        match_row = None
+        available = team_a = team_b = turn = None
+
         async with lock:
             async with database.conn() as c:
                 match_row = await db_get_match(c, self.mn)
                 if not match_row or match_row["status"] != "captains_pending":
                     await interaction.followup.send("Captain setup is no longer active.", ephemeral=True)
                     return
+
                 col = "captain1_discord_id" if self.slot == 1 else "captain2_discord_id"
-                sel = self.values[0]
-                await _x(c, f"UPDATE mm_matches SET {col}=$1 WHERE match_number=$2", sel, self.mn)
+                await _x(c, f"UPDATE mm_matches SET {col}=$1 WHERE match_number=$2", self.values[0], self.mn)
                 match_row = await db_get_match(c, self.mn)
 
-                both_set = match_row["captain1_discord_id"] and match_row["captain2_discord_id"]
-                if both_set:
+                if match_row["captain1_discord_id"] and match_row["captain2_discord_id"]:
+                    both_set = True
                     fp = random.choice([match_row["captain1_discord_id"], match_row["captain2_discord_id"]])
                     await _x(c, "UPDATE mm_matches SET first_picker_discord_id=$1, status='draft' WHERE match_number=$2", fp, self.mn)
                     await _x(c, "UPDATE mm_match_players SET team_side='A', captain=true, pick_order=0 WHERE match_number=$1 AND discord_id=$2", self.mn, match_row["captain1_discord_id"])
@@ -1028,6 +1119,7 @@ class CaptainSelect(discord.ui.Select):
                     team_b    = await db_get_team(c, self.mn, "B")
                     turn      = await db_turn_side(c, match_row)
 
+        # Discord I/O outside the lock.
         if both_set and interaction.guild and match_row["queue_channel_id"] and match_row["queue_message_id"]:
             ch = interaction.guild.get_channel(int(match_row["queue_channel_id"]))
             if isinstance(ch, discord.TextChannel):
@@ -1081,6 +1173,19 @@ class CaptainSetupView(discord.ui.View):
 # ---------------------------------------------------------------
 
 class PickButton(discord.ui.Button):
+    """
+    Draft pick button.
+
+    Concurrency fix (identified in review):
+    The pick operation now runs inside the match lock AND inside a DB
+    transaction. This prevents two simultaneous pick interactions from
+    both passing the turn/player checks and both committing — which
+    would create duplicate assignments or out-of-order picks.
+
+    The lock serialises the Python-level check-then-act.
+    The transaction ensures the DB writes are atomic.
+    """
+
     def __init__(self, cog, mn: int, player_did: str, label: str, row: int):
         super().__init__(label=label[:80], style=discord.ButtonStyle.primary, row=row)
         self.cog        = cog
@@ -1092,70 +1197,77 @@ class PickButton(discord.ui.Button):
             return
         await interaction.response.defer()
 
-        uid = database.did(interaction.user.id)
+        uid  = database.did(interaction.user.id)
+        lock = self.cog.get_lock(self.mn)
 
-        async with database.conn() as c:
-            match_row = await db_get_match(c, self.mn)
-            if not match_row or match_row["status"] != "draft":
-                await interaction.followup.send("Draft is no longer active.", ephemeral=True)
-                return
+        error_msg: str | None = None
+        draft_done = False
+        match_row  = None
+        team_a = team_b = remaining = new_turn = None
 
-            cap_side = await db_captain_side(c, self.mn, uid)
-            if not cap_side:
-                await interaction.followup.send("Only captains can pick players.", ephemeral=True)
-                return
-
-            turn = await db_turn_side(c, match_row)
-            if cap_side != turn:
-                await interaction.followup.send("It is not your turn.", ephemeral=True)
-                return
-
-            player_row = await _q(c,
-                "SELECT * FROM mm_match_players WHERE match_number=$1 AND discord_id=$2 AND team_side IS NULL",
-                self.mn, self.player_did)
-            if not player_row:
-                await interaction.followup.send("Player no longer available.", ephemeral=True)
-                return
-
-            role         = player_row["role_pref"]
-            total_role_r = await _q(c,
-                "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1 AND role_pref=$2",
-                self.mn, role)
-            tri      = total_role_r["n"] if total_role_r else ROLE_MAX_TOTAL.get(role, 0)
-            max_rc   = math.ceil(tri / 2) if tri else 0
-            cur_rc   = await db_role_count_team(c, self.mn, cap_side, role)
-
-            if cur_rc >= max_rc:
-                await interaction.followup.send(f"Your team already has max {r_label(role)}s.", ephemeral=True)
-                return
-
-            pick_n = await db_pick_count(c, self.mn)
-            await _x(c,
-                "UPDATE mm_match_players SET team_side=$1, pick_order=$2 WHERE match_number=$3 AND discord_id=$4",
-                cap_side, pick_n + 1, self.mn, self.player_did)
-
-            remaining = await db_get_available(c, self.mn)
-
-            if not remaining:
-                await _x(c, "UPDATE mm_matches SET status='ready_to_start' WHERE match_number=$1", self.mn)
+        async with lock:
+            # Use a transaction so the pick is atomic: if anything fails
+            # mid-way, the DB state is left unchanged.
+            async with database.transaction() as c:
                 match_row = await db_get_match(c, self.mn)
-                team_a    = await db_get_team(c, self.mn, "A")
-                team_b    = await db_get_team(c, self.mn, "B")
-                await interaction.edit_original_response(
-                    embed=embed_ready(interaction.guild, match_row, team_a, team_b),
-                    view=StartMatchView(self.cog, self.mn),
-                )
-                return
+                if not match_row or match_row["status"] != "draft":
+                    error_msg = "Draft is no longer active."
+                else:
+                    cap_side = await db_captain_side(c, self.mn, uid)
+                    if not cap_side:
+                        error_msg = "Only captains can pick players."
+                    else:
+                        turn = await db_turn_side(c, match_row)
+                        if cap_side != turn:
+                            error_msg = "It is not your turn."
+                        else:
+                            player_row = await _q(c,
+                                "SELECT * FROM mm_match_players WHERE match_number=$1 AND discord_id=$2 AND team_side IS NULL",
+                                self.mn, self.player_did)
+                            if not player_row:
+                                error_msg = "Player no longer available."
+                            else:
+                                role     = player_row["role_pref"]
+                                tri_row  = await _q(c, "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1 AND role_pref=$2", self.mn, role)
+                                tri      = tri_row["n"] if tri_row else ROLE_MAX_TOTAL.get(role, 0)
+                                max_rc   = math.ceil(tri / 2) if tri else 0
+                                cur_rc   = await db_role_count_team(c, self.mn, cap_side, role)
 
-            match_row = await db_get_match(c, self.mn)
-            team_a    = await db_get_team(c, self.mn, "A")
-            team_b    = await db_get_team(c, self.mn, "B")
-            new_turn  = await db_turn_side(c, match_row)
+                                if cur_rc >= max_rc:
+                                    error_msg = f"Your team already has max {r_label(role)}s."
+                                else:
+                                    pick_n = await db_pick_count(c, self.mn)
+                                    await _x(c,
+                                        "UPDATE mm_match_players SET team_side=$1, pick_order=$2 WHERE match_number=$3 AND discord_id=$4",
+                                        cap_side, pick_n + 1, self.mn, self.player_did)
 
-        await interaction.edit_original_response(
-            embed=embed_draft(interaction.guild, match_row, team_a, team_b, remaining, new_turn),
-            view=DraftView(self.cog, self.mn, remaining),
-        )
+                                    remaining = await db_get_available(c, self.mn)
+
+                                    if not remaining:
+                                        await _x(c, "UPDATE mm_matches SET status='ready_to_start' WHERE match_number=$1", self.mn)
+                                        draft_done = True
+
+                                    match_row = await db_get_match(c, self.mn)
+                                    team_a    = await db_get_team(c, self.mn, "A")
+                                    team_b    = await db_get_team(c, self.mn, "B")
+                                    if not draft_done:
+                                        new_turn = await db_turn_side(c, match_row)
+
+        # Discord I/O outside the lock.
+        if error_msg:
+            await interaction.followup.send(error_msg, ephemeral=True)
+            return
+
+        if draft_done:
+            await interaction.edit_original_response(
+                embed=embed_ready(interaction.guild, match_row, team_a, team_b),
+                view=StartMatchView(self.cog, self.mn),
+            )
+        else:
+            await interaction.edit_original_response(
+                embed=embed_draft(interaction.guild, match_row, team_a, team_b, remaining, new_turn),
+                view=DraftView(self.cog, self.mn, remaining),
+            )
 
 
 class DraftView(discord.ui.View):
@@ -1348,16 +1460,11 @@ class ReplaceModal(discord.ui.Modal, title="Replace Player"):
             if await db_is_busy(c, new_did):
                 await interaction.followup.send("That player is already in another queue/match.", ephemeral=True)
                 return
-            old_row = await _q(c,
-                "SELECT * FROM mm_match_players WHERE match_number=$1 AND discord_id=$2",
-                self.mn, self.old_did)
+            old_row = await _q(c, "SELECT * FROM mm_match_players WHERE match_number=$1 AND discord_id=$2", self.mn, self.old_did)
             if not old_row:
                 await interaction.followup.send("Old player not found.", ephemeral=True)
                 return
-            exists_new = await _q(c,
-                "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2",
-                self.mn, new_did)
-            if exists_new:
+            if await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2", self.mn, new_did):
                 await interaction.followup.send("New player is already in this match.", ephemeral=True)
                 return
             await _x(c,
@@ -1417,7 +1524,8 @@ class ReplaceModal(discord.ui.Modal, title="Replace Player"):
 
         asyncio.create_task(upsert_profile_from_member(new_member))
         await interaction.followup.send(
-            f"Replaced. {mention(guild, self.old_did)} received `{REPLACE_LEAVE_PENALTY}` ELO.", ephemeral=True)
+            f"Replaced. {mention(guild, self.old_did)} received `{REPLACE_LEAVE_PENALTY}` ELO.",
+            ephemeral=True)
 
 
 class ReplaceSelect(discord.ui.Select):
@@ -1520,8 +1628,9 @@ class FinishScoreModal(discord.ui.Modal, title="Finish Match"):
 
     def __init__(self, cog, mn, ws, ls, wmvp, lmvp):
         super().__init__()
-        self.cog  = cog; self.mn = mn; self.ws = ws
-        self.ls   = ls;  self.wmvp = wmvp; self.lmvp = lmvp
+        self.cog  = cog;  self.mn   = mn
+        self.ws   = ws;   self.ls   = ls
+        self.wmvp = wmvp; self.lmvp = lmvp
 
     async def on_submit(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not can_manage_mm(interaction.user):
@@ -1553,18 +1662,14 @@ class MMCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot          = bot
-        self._locks:      dict[int, asyncio.Lock]   = {}
-        self._vote_views: dict[int, VoteView]        = {}
-        self._updaters:   dict[int, QueueUpdater]    = {}
-
-    # ── Lock management ─────────────────────────────────────────────────
+        self._locks:      dict[int, asyncio.Lock]  = {}
+        self._vote_views: dict[int, VoteView]       = {}
+        self._updaters:   dict[int, QueueUpdater]   = {}
 
     def get_lock(self, mn: int) -> asyncio.Lock:
         if mn not in self._locks:
             self._locks[mn] = asyncio.Lock()
         return self._locks[mn]
-
-    # ── Vote view management ─────────────────────────────────────────────
 
     def get_vote_view(self, mn: int) -> VoteView | None:
         return self._vote_views.get(mn)
@@ -1575,8 +1680,6 @@ class MMCog(commands.Cog):
     def clear_vote_view(self, mn: int) -> None:
         self._vote_views.pop(mn, None)
 
-    # ── Queue updater management ─────────────────────────────────────────
-
     def get_updater(self, mn: int) -> QueueUpdater | None:
         return self._updaters.get(mn)
 
@@ -1584,9 +1687,11 @@ class MMCog(commands.Cog):
         self._updaters[mn] = u
 
     def clear_updater(self, mn: int) -> None:
-        self._updaters.pop(mn, None)
+        u = self._updaters.pop(mn, None)
+        if u:
+            u.stop()
 
-    # ── finalize_match ───────────────────────────────────────────────────
+    # ── finalize ────────────────────────────────────────────────────────
 
     async def finalize(self, interaction: discord.Interaction,
                        mn: int, ws: str, ls: str,
@@ -1605,28 +1710,24 @@ class MMCog(commands.Cog):
             if match_row["status"] != "in_progress":
                 return False, "Match is not in progress."
 
-            wmvp_row = await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2 AND team_side=$3", mn, wmvp_id, ws)
-            lmvp_row = await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2 AND team_side=$3", mn, lmvp_id, ls)
-            if not wmvp_row: return False, "WMVP must belong to the winner team."
-            if not lmvp_row: return False, "LMVP must belong to the loser team."
+            if not await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2 AND team_side=$3", mn, wmvp_id, ws):
+                return False, "WMVP must belong to the winner team."
+            if not await _q(c, "SELECT 1 FROM mm_match_players WHERE match_number=$1 AND discord_id=$2 AND team_side=$3", mn, lmvp_id, ls):
+                return False, "LMVP must belong to the loser team."
 
-            players    = await db_get_all_players(c, mn)
-            season     = match_row["season_number"]
-            vq         = is_vip_queue(match_row)
-            sp         = is_special(match_row)
-            mult       = match_row["special_multiplier"] or 1
-            base_win   = deltas["winner_delta"] * (VIP_QUEUE_ELO_MULTIPLIER if vq else 1) * (mult if sp else 1)
-            base_loss  = deltas["loser_delta"]
-            elo_chgs   = []
+            players   = await db_get_all_players(c, mn)
+            season    = match_row["season_number"]
+            vq        = is_vip_queue(match_row)
+            sp        = is_special(match_row)
+            mult      = match_row["special_multiplier"] or 1
+            base_win  = deltas["winner_delta"] * (VIP_QUEUE_ELO_MULTIPLIER if vq else 1) * (mult if sp else 1)
+            base_loss = deltas["loser_delta"]
+            elo_chgs  = []
 
             for row in players:
                 is_win = row["team_side"] == ws
-                # VIP fetch uses its own connection — must be outside conn() block.
-                # We'll do it sequentially here (one per player) which is fine
-                # since finalize only runs once per match.
-                vip = None
-                if is_win:
-                    vip = await vip_data.get_active_vip(row["discord_id"])
+                # VIP fetch uses its own connection — must be outside conn().
+                vip = await vip_data.get_active_vip(row["discord_id"]) if is_win else None
                 if is_win:
                     bd  = base_win + (WMVP_BONUS if row["discord_id"] == wmvp_id else 0)
                     vm  = (1.0 + vip_data.VIP_ELO_WIN_BONUS_PERCENT.get(vip["tier"], 0.0)) if vip else 1.0
@@ -1681,7 +1782,7 @@ class MMCog(commands.Cog):
                         pass
         return True, None
 
-    # ── /season commands ─────────────────────────────────────────────────
+    # ── /season ─────────────────────────────────────────────────────────
 
     @season.command(name="start", description="Starts a new Matchmaking season")
     async def season_start(self, i: discord.Interaction, number: int):
@@ -1745,7 +1846,7 @@ class MMCog(commands.Cog):
         e.add_field(name="Top 10",           value=chr(10).join(lines) or "No data.",         inline=False)
         await i.followup.send(embed=e)
 
-    # ── /mm commands ──────────────────────────────────────────────────────
+    # ── /mm ─────────────────────────────────────────────────────────────
 
     @mm.command(name="start", description="Starts a Matchmaking queue")
     async def mm_start(self, i: discord.Interaction, number: int):
@@ -1815,6 +1916,7 @@ class MMCog(commands.Cog):
             team_b = await db_get_team(c, number, "B")
 
         self.clear_updater(number)
+        self.clear_vote_view(number)
 
         guild = i.guild
         if guild and mr["queue_channel_id"] and mr["queue_message_id"]:
@@ -1863,7 +1965,7 @@ class MMCog(commands.Cog):
         target  = member or i.user
         did_val = database.did(target.id)
         await i.response.defer()
-        # VIP uses its own pool slot — fetched outside conn() block.
+        # VIP uses its own pool slot — must be outside conn() block.
         vip = await vip_data.get_active_vip(target.id)
         async with database.conn() as c:
             await db_ensure_mm_player(c, did_val)
