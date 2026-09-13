@@ -504,8 +504,9 @@ async def build_queue_embed(guild: discord.Guild | None, match_row):
         color=discord.Color.gold() if vip_queue else discord.Color.blurple()
     )
 
-    season = await get_active_season()
-    embed.set_footer(text=f"NVL Matchmaking • Season {season['number']}" if season else "NVL Matchmaking")
+    # season_number is already on match_row — no extra DB round-trip needed.
+    season_number = match_row["season_number"]
+    embed.set_footer(text=f"NVL Matchmaking • Season {season_number}" if season_number else "NVL Matchmaking")
     return embed
 
 
@@ -979,31 +980,38 @@ class JoinQueueView(discord.ui.View):
         self.cog = cog
         self.match_number = match_number
 
-    async def refresh_labels(self):
-        grouped = await build_queue_lines(None, self.match_number)
+    async def refresh_message(self, interaction: discord.Interaction):
+        # Single query fetches all players — we reuse it to update button
+        # labels AND build the embed, avoiding 2 duplicate round-trips.
+        rows = await database.fetchall(
+            """
+            SELECT discord_id, role_pref FROM mm_match_players
+            WHERE match_number = $1
+            ORDER BY
+                CASE role_pref WHEN 'setter' THEN 0 WHEN 'outside_hitter' THEN 1 WHEN 'middle_blocker' THEN 2 WHEN 'opposite_hitter' THEN 3 ELSE 4 END,
+                id ASC
+            """,
+            self.match_number,
+        )
+
+        # Update button labels from the same rows.
+        counts: dict[str, int] = {role: 0 for role in ROLE_ORDER}
+        for row in rows:
+            if row["role_pref"] in counts:
+                counts[row["role_pref"]] += 1
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 for role in ROLE_ORDER:
                     if item.custom_id == f"mm_join_{role}_{self.match_number}":
-                        count = len(grouped.get(role, []))
-                        item.label = f"Join {ROLE_LABELS[role]} ({count}/{ROLE_MAX_TOTAL[role]})"
+                        item.label = f"Join {ROLE_LABELS[role]} ({counts[role]}/{ROLE_MAX_TOTAL[role]})"
 
-    async def refresh_message(self, interaction: discord.Interaction):
-        await self.refresh_labels()
+        total = len(rows)
 
         match_row = await get_match_by_number(self.match_number)
         if not match_row:
             return
 
-        total_row = await database.fetchone(
-            "SELECT COUNT(*) AS total FROM mm_match_players WHERE match_number = $1",
-            self.match_number,
-        )
-        total = total_row["total"] if total_row else 0
-
-        # Once full, flip status to team_format_vote exactly once - this
-        # kicks off the Random Teams vs Captain Picks vote before
-        # deciding how to reach captains_pending/ready_to_start.
+        # Once full, flip status to team_format_vote exactly once.
         if total >= QUEUE_SIZE and match_row["status"] == "queue_open":
             await database.execute(
                 """
@@ -1019,9 +1027,6 @@ class JoinQueueView(discord.ui.View):
             return
 
         if match_row["status"] == "team_format_vote":
-            # Reuse the existing TeamFormatVoteView if one is already
-            # running — creating a new instance resets votes to zero
-            # and fires a second 30-second timeout racing the first.
             existing_vote_view = self.cog.get_active_vote_view(self.match_number)
             if existing_vote_view is not None:
                 random_votes, captains_votes = existing_vote_view._tally()
@@ -1046,33 +1051,52 @@ class JoinQueueView(discord.ui.View):
             return
 
         if match_row["status"] == "queue_open":
-            await interaction.edit_original_response(
-                embed=await build_queue_embed(interaction.guild, match_row),
-                view=self
+            # Build the embed using the rows already fetched — no extra query.
+            grouped: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
+            guild = interaction.guild
+            for row in rows:
+                line = f"{mention_or_name(guild, row['discord_id'])} `[{role_short(row['role_pref'])}]`"
+                grouped.setdefault(row["role_pref"], []).append(line)
+
+            vip_queue = is_vip_queue(match_row)
+            season_number = match_row["season_number"]
+            embed = discord.Embed(
+                title=(
+                    f"NVL Matchmaking Queue #{match_row['match_number']}"
+                    + (" • VIP Queue (2x ELO on wins)" if vip_queue else "")
+                ),
+                description=build_queue_sections(grouped),
+                color=discord.Color.gold() if vip_queue else discord.Color.blurple()
             )
+            embed.set_footer(text=f"NVL Matchmaking • Season {season_number}" if season_number else "NVL Matchmaking")
+            await interaction.edit_original_response(embed=embed, view=self)
 
     async def _join_role(self, interaction: discord.Interaction, role_pref: str):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        # This does several sequential database calls (and possibly a
-        # VIP lookup) before it can know whether the join even
-        # succeeds. Ack immediately so a slow round-trip to Supabase
-        # never shows "This interaction failed" on the button click.
+        # Acknowledge IMMEDIATELY — must be the very first await so
+        # Discord never times out the interaction before we respond.
         await interaction.response.defer()
 
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
-            match_row = await get_match_by_number(self.match_number)
+            # Run the three independent read-queries in parallel to cut
+            # sequential Supabase round-trips from 4 down to 2.
+            match_row, existing_row, vip = await asyncio.gather(
+                get_match_by_number(self.match_number),
+                database.fetchone(
+                    "SELECT 1 FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
+                    self.match_number, database.did(interaction.user.id),
+                ),
+                vip_data.get_active_vip(interaction.user.id),
+            )
+
             if not match_row or match_row["status"] != "queue_open":
                 await interaction.followup.send("This queue is no longer open.", ephemeral=True)
                 return
 
-            existing_row = await database.fetchone(
-                "SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
-                self.match_number, database.did(interaction.user.id),
-            )
             if existing_row:
                 await interaction.followup.send("You are already in this queue.", ephemeral=True)
                 return
@@ -1081,14 +1105,12 @@ class JoinQueueView(discord.ui.View):
                 await interaction.followup.send("You are already in another active queue/match.", ephemeral=True)
                 return
 
+            is_vip_plus = bool(vip and vip["tier"] == "vip_plus")
             count_row = await database.fetchone(
                 "SELECT COUNT(*) AS total FROM mm_match_players WHERE match_number = $1 AND role_pref = $2",
                 self.match_number, role_pref,
             )
             role_count = count_row["total"] if count_row else 0
-
-            vip = await vip_data.get_active_vip(interaction.user.id)
-            is_vip_plus = bool(vip and vip["tier"] == "vip_plus")
 
             if role_count >= ROLE_MAX_TOTAL[role_pref]:
                 if not is_vip_plus:
@@ -1097,9 +1119,8 @@ class JoinQueueView(discord.ui.View):
                     )
                     return
 
-                # VIP+ priority: can take a spot in a position that's
-                # already full, but only while the overall queue still
-                # has an open slot somewhere (never exceeds QUEUE_SIZE).
+                # VIP+ priority: can take a spot in a full position as
+                # long as the overall queue still has room.
                 total_row = await database.fetchone(
                     "SELECT COUNT(*) AS total FROM mm_match_players WHERE match_number = $1",
                     self.match_number,
@@ -1109,8 +1130,11 @@ class JoinQueueView(discord.ui.View):
                     await interaction.followup.send("This queue is already full.", ephemeral=True)
                     return
 
-            priority_weight = await vip_data.get_captain_priority_weight(interaction.user.id)
-            await upsert_profile_from_member(interaction.user)
+            # Derive priority_weight from the VIP we already fetched —
+            # avoids calling get_active_vip a second time.
+            priority_weight = (
+                vip_data.VIP_CAPTAIN_PRIORITY_WEIGHT.get(vip["tier"], 0) if vip else 0
+            )
 
             try:
                 await database.execute(
@@ -1125,6 +1149,10 @@ class JoinQueueView(discord.ui.View):
             except asyncpg.UniqueViolationError:
                 await interaction.followup.send("You have already joined this queue.", ephemeral=True)
                 return
+
+            # Fire-and-forget — keeps profile fresh on the site without
+            # blocking the embed update.
+            asyncio.create_task(upsert_profile_from_member(interaction.user))
 
             await self.refresh_message(interaction)
 
@@ -1183,16 +1211,9 @@ class JoinQueueView(discord.ui.View):
                 self.match_number, database.did(interaction.user.id),
             )
 
-            # Refresh the queue embed directly via edit_original_response.
-            # Never use interaction.message after a defer() — it requires
-            # an extra HTTP fetch and is what causes the 15-second delay.
-            await self.refresh_labels()
-            updated_match = await get_match_by_number(self.match_number)
-            if updated_match and updated_match["status"] == "queue_open":
-                await interaction.edit_original_response(
-                    embed=await build_queue_embed(interaction.guild, updated_match),
-                    view=self
-                )
+            # refresh_message handles labels + embed in 2 queries and uses
+            # edit_original_response — never interaction.message after defer().
+            await self.refresh_message(interaction)
 
 
 class TeamFormatVoteView(discord.ui.View):
@@ -2449,7 +2470,6 @@ class MatchmakingCog(commands.Cog):
 
         match_row = await get_match_by_number(number)
         view = JoinQueueView(self, number)
-        await view.refresh_labels()
 
         sent_message = await interaction.followup.send(
             embed=await build_queue_embed(interaction.guild, match_row),
