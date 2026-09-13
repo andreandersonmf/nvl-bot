@@ -1,52 +1,36 @@
 """
-Database access layer for National Volleyball League.
+Database access layer — NVL Bot.
 
-Replaces the old SQLite (nvl.db) local file. The bot now talks
-directly to the same Supabase Postgres database the site uses, via a
-plain Postgres connection (asyncpg) - no local "shadow" copy, no
-sync bridge. There is exactly one source of truth per table.
+Uses asyncpg with a shared connection pool. The key design principle:
+callers that need multiple queries in one operation should use the
+`conn()` context manager to acquire ONE connection and reuse it,
+instead of letting each helper acquire/release separately.
 
-Every function here is a thin async wrapper around a shared
-connection pool. Call sites look almost the same as the old sqlite3
-helpers, except every call needs `await` and placeholders are
-Postgres-style ($1, $2, ...) instead of SQLite's "?".
-
-Row objects (asyncpg.Record) support the same dict-style access the
-old sqlite3.Row did (row["column_name"]), so most call sites that
-read result rows do not need to change.
+This eliminates pool contention (the main cause of perceived latency)
+when several queries happen in sequence inside a single interaction.
 """
-
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import asyncpg
-
 import config
 
 _pool: asyncpg.Pool | None = None
 
 
 async def init_pool() -> None:
-    """Create the shared connection pool. Call once from bot.py's setup_hook."""
     global _pool
     if _pool is not None:
         return
     if not config.DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is not set. Copy .env.example, fill in your Supabase "
-            "Postgres connection string, and restart the bot."
-        )
+        raise RuntimeError("DATABASE_URL is not set.")
     _pool = await asyncpg.create_pool(
         dsn=config.DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        # Required for compatibility with Supabase's PgBouncer pooler
-        # (transaction mode does not support server-side prepared
-        # statement caching). Harmless if you use the direct/session
-        # connection instead.
-        statement_cache_size=0,
+        min_size=2,
+        max_size=10,          # raised from 5 — handles concurrent interactions
+        statement_cache_size=0,  # required for Supabase PgBouncer
     )
 
 
@@ -63,88 +47,60 @@ def is_ready() -> bool:
 
 def _require_pool() -> asyncpg.Pool:
     if _pool is None:
-        raise RuntimeError("Database pool is not initialized. Call database.init_pool() first.")
+        raise RuntimeError("Database pool not initialized.")
     return _pool
 
 
-async def execute(query: str, *params: Any) -> str:
-    """Run an INSERT/UPDATE/DELETE (or DDL). Returns the driver status string."""
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        return await conn.execute(query, *params)
+# ---------------------------------------------------------------------------
+# Single-connection context manager
+# Use this when you have multiple queries in one operation so they all share
+# one pool slot instead of each queuing for their own.
+# ---------------------------------------------------------------------------
 
-
-async def fetchval(query: str, *params: Any) -> Any:
-    """Run a query and return a single scalar value, e.g. `... RETURNING id`."""
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchval(query, *params)
-
-
-async def fetchone(query: str, *params: Any) -> asyncpg.Record | None:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(query, *params)
-
-
-async def fetchall(query: str, *params: Any) -> list[asyncpg.Record]:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch(query, *params)
+@asynccontextmanager
+async def conn() -> AsyncIterator[asyncpg.Connection]:
+    """Acquire one connection for the duration of the block."""
+    async with _require_pool().acquire() as c:
+        yield c
 
 
 @asynccontextmanager
 async def transaction() -> AsyncIterator[asyncpg.Connection]:
-    """
-    Use for multi-statement operations that must succeed or fail
-    together (e.g. finishing a ranked match and updating every
-    participant's ELO). Usage:
-
-        async with database.transaction() as conn:
-            await conn.execute(...)
-            await conn.execute(...)
-    """
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            yield conn
+    """Acquire one connection and wrap everything in a transaction."""
+    async with _require_pool().acquire() as c:
+        async with c.transaction():
+            yield c
 
 
-async def insert_returning(table: str, values: dict[str, Any]) -> asyncpg.Record | None:
-    """
-    INSERT INTO <table> (...) VALUES (...) RETURNING *, built from a plain
-    dict - mirrors the `.insert(payload)` style already used on the site
-    side. Keeps call sites readable and avoids hand-counting $1, $2, ...
-    placeholders (a common source of bugs when porting SQLite queries).
-    """
-    columns = list(values.keys())
-    placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
-    query = f'INSERT INTO {table} ({", ".join(columns)}) VALUES ({placeholders}) RETURNING *'
-    return await fetchone(query, *[values[c] for c in columns])
+# ---------------------------------------------------------------------------
+# Convenience one-shot helpers (each acquires its own connection).
+# Fine for isolated single queries; prefer conn() for multi-query blocks.
+# ---------------------------------------------------------------------------
+
+async def execute(query: str, *params: Any) -> str:
+    async with _require_pool().acquire() as c:
+        return await c.execute(query, *params)
 
 
-async def update_returning(
-    table: str, values: dict[str, Any], where: dict[str, Any]
-) -> asyncpg.Record | None:
-    """UPDATE <table> SET ... WHERE ... RETURNING *, built from plain dicts."""
-    set_columns = list(values.keys())
-    where_columns = list(where.keys())
-    set_clause = ", ".join(f"{c} = ${i + 1}" for i, c in enumerate(set_columns))
-    where_clause = " AND ".join(
-        f"{c} = ${i + 1 + len(set_columns)}" for i, c in enumerate(where_columns)
-    )
-    query = f"UPDATE {table} SET {set_clause} WHERE {where_clause} RETURNING *"
-    params = [values[c] for c in set_columns] + [where[c] for c in where_columns]
-    return await fetchone(query, *params)
+async def fetchval(query: str, *params: Any) -> Any:
+    async with _require_pool().acquire() as c:
+        return await c.fetchval(query, *params)
+
+
+async def fetchone(query: str, *params: Any) -> asyncpg.Record | None:
+    async with _require_pool().acquire() as c:
+        return await c.fetchrow(query, *params)
+
+
+async def fetchall(query: str, *params: Any) -> list[asyncpg.Record]:
+    async with _require_pool().acquire() as c:
+        return await c.fetch(query, *params)
 
 
 def did(value: Any) -> str | None:
-    """
-    Normalize a Discord snowflake (int, str, discord.abc.Snowflake, or
-    None) to the text form used by every discord_id-style column.
-    Every value written to or compared against a discord_id column
-    should be passed through this first.
-    """
+    """Normalise a Discord snowflake to the text form used in every discord_id column."""
     if value is None:
         return None
-    return str(int(value)) if isinstance(value, str) and value.isdigit() else str(value)
+    if isinstance(value, str):
+        return value if value.isdigit() else value
+    return str(value)
