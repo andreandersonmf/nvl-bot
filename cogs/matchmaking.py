@@ -1020,13 +1020,10 @@ class JoinQueueView(discord.ui.View):
 
         if match_row["status"] == "team_format_vote":
             # Reuse the existing TeamFormatVoteView if one is already
-            # running for this match - creating a new instance would
-            # wipe any votes already cast and start a second 30-second
-            # timeout racing against the first one.
+            # running — creating a new instance resets votes to zero
+            # and fires a second 30-second timeout racing the first.
             existing_vote_view = self.cog.get_active_vote_view(self.match_number)
             if existing_vote_view is not None:
-                # Vote already in progress - just refresh the embed to
-                # show the latest tally without touching the view state.
                 random_votes, captains_votes = existing_vote_view._tally()
                 embed = build_team_format_vote_embed(
                     match_row, random_votes, captains_votes,
@@ -1036,8 +1033,8 @@ class JoinQueueView(discord.ui.View):
             else:
                 vote_view = TeamFormatVoteView(self.cog, self.match_number, total)
                 embed = build_team_format_vote_embed(match_row, 0, 0, 0, total)
-                await interaction.edit_original_response(embed=embed, view=vote_view)
-                vote_view.message = interaction.message
+                msg = await interaction.edit_original_response(embed=embed, view=vote_view)
+                vote_view.message = msg
                 self.cog.register_vote_view(self.match_number, vote_view)
             return
 
@@ -1186,11 +1183,9 @@ class JoinQueueView(discord.ui.View):
                 self.match_number, database.did(interaction.user.id),
             )
 
-            # Refresh labels then edit the original deferred response
-            # directly - same pattern as _join_role so the update is
-            # always sent through the followup/edit path, not via
-            # interaction.message (which can be None when the view is
-            # reconstructed after a bot restart).
+            # Refresh the queue embed directly via edit_original_response.
+            # Never use interaction.message after a defer() — it requires
+            # an extra HTTP fetch and is what causes the 15-second delay.
             await self.refresh_labels()
             updated_match = await get_match_by_number(self.match_number)
             if updated_match and updated_match["status"] == "queue_open":
@@ -1300,9 +1295,6 @@ class TeamFormatVoteView(discord.ui.View):
             return
         self.resolved = True
         self.stop()
-
-        # Unregister from the cog so no new join/leave triggers will
-        # accidentally reuse or duplicate this view after it finishes.
         self.cog.unregister_vote_view(self.match_number)
 
         match_row = await get_match_by_number(self.match_number)
@@ -2248,10 +2240,9 @@ class MatchmakingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.match_locks: dict[int, asyncio.Lock] = {}
-        # Keeps track of the one TeamFormatVoteView that is currently
-        # active per match. Prevents refresh_message from creating a
-        # second view (which would wipe votes and start a duplicate
-        # 30-second timeout) when the queue becomes full.
+        # One active TeamFormatVoteView per match. Prevents refresh_message
+        # from creating a duplicate view (and second 30-s timeout) when
+        # multiple players join at the same instant the queue fills.
         self._active_vote_views: dict[int, "TeamFormatVoteView"] = {}
 
     def get_match_lock(self, match_number: int) -> asyncio.Lock:
