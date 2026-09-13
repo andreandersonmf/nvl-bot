@@ -26,15 +26,11 @@ MATCHMAKING_CATEGORY_ID = config.MATCHMAKING_CATEGORY_ID
 MM_RESULTS_CHANNEL_ID = config.MM_RESULTS_CHANNEL_ID
 ELO_UPDATE_CHANNEL_ID = config.ELO_UPDATE_CHANNEL_ID
 
-# Position system: the real CVR game's 4 roles, 6 players per team
-# (12 total per match). Replaces the old placeholder Setter(2)/Spiker(4)
-# per-team split from the previous bot.
 ROLE_SETTER = "setter"
 ROLE_OUTSIDE_HITTER = "outside_hitter"
 ROLE_MIDDLE_BLOCKER = "middle_blocker"
 ROLE_OPPOSITE_HITTER = "opposite_hitter"
 
-# Display order used everywhere a queue/roster is listed.
 ROLE_ORDER = [ROLE_SETTER, ROLE_OUTSIDE_HITTER, ROLE_MIDDLE_BLOCKER, ROLE_OPPOSITE_HITTER]
 
 ROLE_LABELS = {
@@ -51,8 +47,6 @@ ROLE_SHORT = {
     ROLE_OPPOSITE_HITTER: "OP",
 }
 
-# Max per role across the WHOLE queue (both teams combined) - 1 Setter,
-# 2 Outside Hitters, 2 Middle Blockers, 1 Opposite Hitter per team.
 ROLE_MAX_TOTAL = {
     ROLE_SETTER: 2,
     ROLE_OUTSIDE_HITTER: 4,
@@ -62,7 +56,6 @@ ROLE_MAX_TOTAL = {
 
 QUEUE_SIZE = sum(ROLE_MAX_TOTAL.values())  # 12
 
-# SQL snippet to order players by role in a stable, consistent way.
 ROLE_ORDER_SQL = (
     "CASE role_pref "
     "WHEN 'setter' THEN 0 "
@@ -72,10 +65,6 @@ ROLE_ORDER_SQL = (
     "ELSE 4 END"
 )
 
-# VIP-only queue channel (access is restricted via Discord role
-# permissions on the channel itself - the bot does not need to check
-# membership). Wins in a match opened here are worth double ELO, on
-# top of the Golden Match multiplier and each winner's own VIP % bonus.
 VIP_QUEUE_CHANNEL_ID = 1547095549264666654
 VIP_QUEUE_ELO_MULTIPLIER = 2
 
@@ -108,7 +97,6 @@ def has_role(member: discord.Member, role_id: int) -> bool:
 def can_manage_season(member: discord.Member) -> bool:
     if is_admin(member):
         return True
-
     staff_ids = config.STAFF_APPROVER_ROLE_IDS
     member_role_ids = {role.id for role in member.roles}
     return any(role_id in member_role_ids for role_id in staff_ids)
@@ -136,11 +124,9 @@ def is_vip_queue(match_row) -> bool:
 
 
 async def get_vip_badges_for(discord_ids: list[str]) -> dict[str, str]:
-    """Batch lookup for the leaderboard: {discord_id: ' 👑 VIP+'/' ⭐ VIP'}."""
     ids = [d for d in discord_ids if d]
     if not ids:
         return {}
-
     rows = await database.fetchall(
         """
         SELECT discord_id, tier FROM vip_subscriptions
@@ -148,7 +134,6 @@ async def get_vip_badges_for(discord_ids: list[str]) -> dict[str, str]:
         """,
         ids,
     )
-
     badges = {}
     for row in rows:
         badges[row["discord_id"]] = " 👑 VIP+" if row["tier"] == "vip_plus" else " ⭐ VIP"
@@ -156,7 +141,7 @@ async def get_vip_badges_for(discord_ids: list[str]) -> dict[str, str]:
 
 
 # =========================
-# DATA ACCESS (async, shared Postgres schema)
+# DATA ACCESS
 # =========================
 
 async def get_active_season():
@@ -246,18 +231,6 @@ async def count_team_role(match_number: int, side: str, role_pref: str) -> int:
 
 
 async def assign_random_teams(match_number: int) -> None:
-    """
-    Splits the full queue into two random teams, one role at a time,
-    so each team ends up with the right position mix (1 Setter, 2
-    Outside Hitters, 2 Middle Blockers, 1 Opposite Hitter). Used when
-    "Random Teams" wins the post-queue format vote, as an alternative
-    to the normal captains-and-draft flow.
-
-    Mirrors the same ceil(total/2)-per-team split the draft uses to
-    handle VIP+ overflow (e.g. 3 Setters instead of 2): the extra
-    player's side is picked at random rather than always favoring the
-    same team.
-    """
     for role in ROLE_ORDER:
         players = await database.fetchall(
             "SELECT discord_id FROM mm_match_players WHERE match_number = $1 AND role_pref = $2",
@@ -265,12 +238,10 @@ async def assign_random_teams(match_number: int) -> None:
         )
         ids = [row["discord_id"] for row in players]
         random.shuffle(ids)
-
         half = len(ids) // 2
         remainder = len(ids) - 2 * half
         extra_to_a = bool(remainder) and random.random() < 0.5
         a_count = half + (1 if extra_to_a else 0)
-
         for discord_id in ids[:a_count]:
             await database.execute(
                 "UPDATE mm_match_players SET team_side = 'A' WHERE match_number = $1 AND discord_id = $2",
@@ -310,11 +281,9 @@ async def get_current_turn_side(match_row) -> str | None:
     available = await get_available_players(match_row["match_number"])
     if not available:
         return None
-
     picks_done = await get_pick_count(match_row["match_number"])
     first_side = "A" if match_row["first_picker_discord_id"] == match_row["captain1_discord_id"] else "B"
     second_side = "B" if first_side == "A" else "A"
-
     return first_side if picks_done % 2 == 0 else second_side
 
 
@@ -342,27 +311,13 @@ def is_special_match(match_row) -> bool:
 
 
 def parse_final_score(final_score_text: str) -> tuple[list[tuple[int, int]] | None, str | None]:
-    """
-    Expected format:
-    Team A - Team B for each set
-
-    Valid examples:
-    25-20
-    25-20, 22-25, 15-11
-    25-21 | 25-18
-    25:21, 25:18
-    25x21, 25x18
-    """
     raw = final_score_text.strip()
     if not raw:
         return None, "Final Score cannot be empty."
-
     parts = [p.strip() for p in re.split(r"[,|\n;]+", raw) if p.strip()]
     if not parts:
         return None, "Invalid Final Score format."
-
     set_scores: list[tuple[int, int]] = []
-
     for part in parts:
         normalized = re.sub(r"\s*[xX:]\s*", "-", part)
         match = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", normalized)
@@ -371,31 +326,19 @@ def parse_final_score(final_score_text: str) -> tuple[list[tuple[int, int]] | No
                 "Invalid Final Score format. Use Team A - Team B for each set. "
                 "Example: `25-20, 22-25, 15-11`"
             )
-
         a_score = int(match.group(1))
         b_score = int(match.group(2))
-
         if a_score == b_score:
             return None, "A set cannot end in a tie."
-
         if a_score < 0 or b_score < 0:
             return None, "Scores cannot be negative."
-
         set_scores.append((a_score, b_score))
-
     return set_scores, None
 
 
 def count_set_wins(set_scores: list[tuple[int, int]]) -> tuple[int, int]:
-    team_a_wins = 0
-    team_b_wins = 0
-
-    for a_score, b_score in set_scores:
-        if a_score > b_score:
-            team_a_wins += 1
-        else:
-            team_b_wins += 1
-
+    team_a_wins = sum(1 for a, b in set_scores if a > b)
+    team_b_wins = sum(1 for a, b in set_scores if b > a)
     return team_a_wins, team_b_wins
 
 
@@ -416,26 +359,20 @@ def calculate_match_team_deltas(
     winner_side: str
 ) -> tuple[dict | None, str | None]:
     team_a_wins, team_b_wins = count_set_wins(set_scores)
-
     if team_a_wins == team_b_wins:
         return None, "Final Score is tied in sets. A match must have a winner."
-
     actual_winner = "A" if team_a_wins > team_b_wins else "B"
     if actual_winner != winner_side:
         return None, (
             f"The selected winner team does not match the Final Score. "
             f"Score indicates Team {actual_winner} as winner."
         )
-
     total_margin = sum(abs(a - b) for a, b in set_scores)
     avg_margin = total_margin / len(set_scores)
     dominance_bonus = get_margin_bonus(avg_margin)
-
     winner_delta = BASE_WIN_ELO + dominance_bonus
     loser_delta = BASE_LOSS_ELO - round(dominance_bonus * 0.75)
-
     final_score_display = " | ".join(f"{a}-{b}" for a, b in set_scores)
-
     return {
         "team_a_sets": team_a_wins,
         "team_b_sets": team_b_wins,
@@ -470,13 +407,10 @@ async def build_queue_lines(guild: discord.Guild | None, match_number: int):
         """,
         match_number,
     )
-
     grouped: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
-
     for row in rows:
         line = f"{mention_or_name(guild, row['discord_id'])} `[{role_short(row['role_pref'])}]`"
         grouped.setdefault(row["role_pref"], []).append(line)
-
     return grouped
 
 
@@ -494,7 +428,6 @@ def build_queue_sections(grouped: dict[str, list[str]]) -> str:
 async def build_queue_embed(guild: discord.Guild | None, match_row):
     grouped = await build_queue_lines(guild, match_row["match_number"])
     vip_queue = is_vip_queue(match_row)
-
     embed = discord.Embed(
         title=(
             f"NVL Matchmaking Queue #{match_row['match_number']}"
@@ -503,8 +436,6 @@ async def build_queue_embed(guild: discord.Guild | None, match_row):
         description=build_queue_sections(grouped),
         color=discord.Color.gold() if vip_queue else discord.Color.blurple()
     )
-
-    # season_number is already on match_row — no extra DB round-trip needed.
     season_number = match_row["season_number"]
     embed.set_footer(text=f"NVL Matchmaking • Season {season_number}" if season_number else "NVL Matchmaking")
     return embed
@@ -532,12 +463,11 @@ async def build_captains_embed(guild: discord.Guild | None, match_row):
         SELECT * FROM mm_match_players
         WHERE match_number = $1
         ORDER BY
-            CASE role_pref WHEN 'setter' THEN 0 WHEN 'outside_hitter' THEN 1 WHEN 'middle_blocker' THEN 2 WHEN 'opposite_hitter' THEN 3 ELSE 4 END,
+            CASE role_pref WHEN 'setter' THEN 0 WHEN 'outside_hitter' THEN 1 WHEN 'middle_blocker' THEN 2 WHEN 'outside_hitter' THEN 3 ELSE 4 END,
             id ASC
         """,
         match_row["match_number"],
     )
-
     lines = []
     for row in all_players:
         suffix = f" [{role_short(row['role_pref'])}]"
@@ -545,9 +475,7 @@ async def build_captains_embed(guild: discord.Guild | None, match_row):
             suffix += " • CAPTAIN 1"
         elif match_row["captain2_discord_id"] == row["discord_id"]:
             suffix += " • CAPTAIN 2"
-
         lines.append(f"{mention_or_name(guild, row['discord_id'])}`{suffix}`")
-
     embed = discord.Embed(
         title=f"Queue #{match_row['match_number']} • Set Captains",
         description=(
@@ -573,9 +501,7 @@ def build_team_lines(guild: discord.Guild | None, players, wmvp_id: str | None =
             tags.append("WMVP")
         if lmvp_id and row["discord_id"] == lmvp_id:
             tags.append("LMVP")
-
         lines.append(f"{mention_or_name(guild, row['discord_id'])} `[{', '.join(tags)}]`")
-
     return chr(10).join(lines) if lines else "—"
 
 
@@ -584,17 +510,11 @@ async def build_draft_embed(guild: discord.Guild | None, match_row):
     team_b = await get_team_players(match_row["match_number"], "B")
     available = await get_available_players(match_row["match_number"])
     current_turn_side = await get_current_turn_side(match_row)
-
     available_lines = [
         f"{mention_or_name(guild, row['discord_id'])} `[{role_short(row['role_pref'])}]`"
         for row in available
     ]
-
-    if not current_turn_side:
-        turn_text = "Draft complete"
-    else:
-        turn_text = f"{team_side_label(current_turn_side)} Captain"
-
+    turn_text = "Draft complete" if not current_turn_side else f"{team_side_label(current_turn_side)} Captain"
     embed = discord.Embed(
         title=f"Queue #{match_row['match_number']} • Draft Phase",
         color=discord.Color.green()
@@ -607,7 +527,6 @@ async def build_draft_embed(guild: discord.Guild | None, match_row):
         inline=False
     )
     embed.add_field(name="Current Turn", value=turn_text, inline=False)
-
     first_picker = mention_or_name(guild, match_row["first_picker_discord_id"]) if match_row["first_picker_discord_id"] else "—"
     embed.set_footer(text=f"First pick: {first_picker}")
     return embed
@@ -616,7 +535,6 @@ async def build_draft_embed(guild: discord.Guild | None, match_row):
 async def build_ready_embed(guild: discord.Guild | None, match_row):
     team_a = await get_team_players(match_row["match_number"], "A")
     team_b = await get_team_players(match_row["match_number"], "B")
-
     embed = discord.Embed(
         title=f"Queue #{match_row['match_number']} • Teams Ready",
         description="All picks are complete. Match Organizer can now start the match.",
@@ -630,12 +548,9 @@ async def build_ready_embed(guild: discord.Guild | None, match_row):
 async def build_match_started_embed(guild: discord.Guild | None, match_row):
     team_a = await get_team_players(match_row["match_number"], "A")
     team_b = await get_team_players(match_row["match_number"], "B")
-
     special = is_special_match(match_row)
     multiplier = match_row["special_multiplier"] or 1
-
     description = f"**Private Server Link**\n{match_row['private_server_link']}"
-
     if special:
         description = (
             f"## {SPECIAL_MATCH_NAME}\n"
@@ -643,23 +558,15 @@ async def build_match_started_embed(guild: discord.Guild | None, match_row):
             f"The winning team will earn **{multiplier}x Elo**.\n\n"
             f"**Private Server Link**\n{match_row['private_server_link']}"
         )
-
     embed = discord.Embed(
         title=f"Match In Progress • #{match_row['match_number']}",
         description=description,
         color=discord.Color.gold() if special else discord.Color.dark_green()
     )
-
     embed.add_field(name="Team A", value=build_team_lines(guild, team_a), inline=False)
     embed.add_field(name="Team B", value=build_team_lines(guild, team_b), inline=False)
-
     if special:
-        embed.add_field(
-            name="Bonus Rule",
-            value=f"Winner receives **{multiplier}x Elo** for this match.",
-            inline=False
-        )
-
+        embed.add_field(name="Bonus Rule", value=f"Winner receives **{multiplier}x Elo** for this match.", inline=False)
     embed.set_footer(
         text="NVL Matchmaking • VIP Queue (2x ELO on wins)" if is_vip_queue(match_row) else "NVL Matchmaking"
     )
@@ -669,26 +576,14 @@ async def build_match_started_embed(guild: discord.Guild | None, match_row):
 async def build_result_embed(guild: discord.Guild | None, match_row):
     winners = await get_team_players(match_row["match_number"], match_row["winner_side"])
     losers = await get_team_players(match_row["match_number"], match_row["loser_side"])
-
-    embed = discord.Embed(
-        title=f"Match Result • #{match_row['match_number']}",
-        color=discord.Color.purple()
-    )
-
+    embed = discord.Embed(title=f"Match Result • #{match_row['match_number']}", color=discord.Color.purple())
     special = is_special_match(match_row)
     multiplier = match_row["special_multiplier"] or 1
-
     if special:
         embed.color = discord.Color.gold()
-        embed.description = (
-            f"{SPECIAL_MATCH_NAME}\n"
-            f"Winner team earned **{multiplier}x Elo** in this match."
-        )
-
-    final_score_text = match_row["final_score_text"]
-    if final_score_text:
-        embed.add_field(name="Final Score", value=final_score_text, inline=False)
-
+        embed.description = f"{SPECIAL_MATCH_NAME}\nWinner team earned **{multiplier}x Elo** in this match."
+    if match_row["final_score_text"]:
+        embed.add_field(name="Final Score", value=match_row["final_score_text"], inline=False)
     embed.add_field(
         name=f"{team_side_label(match_row['winner_side'])} • Winner",
         value=build_team_lines(guild, winners, wmvp_id=match_row["wmvp_discord_id"]),
@@ -708,19 +603,13 @@ async def build_result_embed(guild: discord.Guild | None, match_row):
 async def build_elo_update_embed(guild: discord.Guild | None, match_row, elo_changes: list[dict]):
     winners = []
     losers = []
-
     for change in elo_changes:
         row = await database.fetchone(
-            """
-            SELECT team_side FROM mm_match_players
-            WHERE match_number = $1 AND discord_id = $2
-            """,
+            "SELECT team_side FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
             match_row["match_number"], database.did(change["discord_id"]),
         )
-
         if not row:
             continue
-
         tags = []
         if change["is_win_mvp"]:
             tags.append("WMVP")
@@ -728,65 +617,36 @@ async def build_elo_update_embed(guild: discord.Guild | None, match_row, elo_cha
             tags.append("LMVP")
         if change.get("vip_tier"):
             tags.append(vip_data.vip_tier_label(change["vip_tier"]))
-
         suffix = f" ({', '.join(tags)})" if tags else ""
         line = (
             f"{mention_or_name(guild, change['discord_id'])}{suffix} • "
             f"`{format_elo_delta(change['delta'])}` → `{change['new_elo']}`"
         )
-
         if row["team_side"] == match_row["winner_side"]:
             winners.append(line)
         else:
             losers.append(line)
-
-    embed = discord.Embed(
-        title=f"ELO Update • Match #{match_row['match_number']}",
-        color=discord.Color.orange()
-    )
-
+    embed = discord.Embed(title=f"ELO Update • Match #{match_row['match_number']}", color=discord.Color.orange())
     special = is_special_match(match_row)
     multiplier = match_row["special_multiplier"] or 1
-
     if special:
         embed.color = discord.Color.gold()
-        embed.description = (
-            f"{SPECIAL_MATCH_NAME}\n"
-            f"Winning team received **{multiplier}x Elo**."
-        )
-
+        embed.description = f"{SPECIAL_MATCH_NAME}\nWinning team received **{multiplier}x Elo**."
     if match_row["final_score_text"]:
         embed.add_field(name="Final Score", value=match_row["final_score_text"], inline=False)
-
     if special:
-        embed.add_field(
-            name="Special Bonus",
-            value=f"Winner team had its base Elo multiplied by **x{multiplier}**.",
-            inline=False
-        )
-
-    embed.add_field(
-        name=f"{team_side_label(match_row['winner_side'])} • Gained",
-        value="\n".join(winners) if winners else "—",
-        inline=False
-    )
-    embed.add_field(
-        name=f"{team_side_label(match_row['loser_side'])} • Lost",
-        value="\n".join(losers) if losers else "—",
-        inline=False
-    )
+        embed.add_field(name="Special Bonus", value=f"Winner team had its base Elo multiplied by **x{multiplier}**.", inline=False)
+    embed.add_field(name=f"{team_side_label(match_row['winner_side'])} • Gained", value="\n".join(winners) if winners else "—", inline=False)
+    embed.add_field(name=f"{team_side_label(match_row['loser_side'])} • Lost", value="\n".join(losers) if losers else "—", inline=False)
     embed.set_footer(text="ELO after match finish")
     return embed
 
 
 async def build_cancelled_embed(guild: discord.Guild | None, match_row, cancelled_by_id: int | None = None):
     grouped = await build_queue_lines(guild, match_row["match_number"])
-
     description = build_queue_sections(grouped) + "\n\n**Status:** Cancelled"
-
     if cancelled_by_id:
         description += f"\n**Cancelled by:** {mention_or_name(guild, cancelled_by_id)}"
-
     embed = discord.Embed(
         title=f"NVL Matchmaking Queue #{match_row['match_number']} • Cancelled",
         description=description,
@@ -799,7 +659,6 @@ async def build_cancelled_embed(guild: discord.Guild | None, match_row, cancelle
 async def build_cancelled_in_progress_embed(guild: discord.Guild | None, match_row, cancelled_by_id: int | None = None):
     team_a = await get_team_players(match_row["match_number"], "A")
     team_b = await get_team_players(match_row["match_number"], "B")
-
     embed = discord.Embed(
         title=f"Match Cancelled • #{match_row['match_number']}",
         description="This match was cancelled after being started.",
@@ -807,10 +666,8 @@ async def build_cancelled_in_progress_embed(guild: discord.Guild | None, match_r
     )
     embed.add_field(name="Team A", value=build_team_lines(guild, team_a), inline=False)
     embed.add_field(name="Team B", value=build_team_lines(guild, team_b), inline=False)
-
     if cancelled_by_id:
         embed.add_field(name="Cancelled by", value=mention_or_name(guild, cancelled_by_id), inline=False)
-
     return embed
 
 
@@ -827,16 +684,13 @@ async def apply_match_result_to_player(
     is_loss_mvp: bool
 ):
     await ensure_mm_player(discord_id)
-
     player = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(discord_id))
     if not player:
         return None
-
     old_elo = player["elo"]
     new_elo = max(0, old_elo + delta)
     elo_gained = delta if delta > 0 else 0
     elo_lost = abs(delta) if delta < 0 else 0
-
     await database.execute(
         """
         UPDATE mm_players
@@ -859,10 +713,8 @@ async def apply_match_result_to_player(
         elo_lost,
         database.did(discord_id),
     )
-
     if season_number is not None:
         await ensure_mm_season_player(season_number, discord_id)
-
         await database.execute(
             """
             UPDATE mm_season_players
@@ -884,7 +736,6 @@ async def apply_match_result_to_player(
             season_number,
             database.did(discord_id),
         )
-
     return {
         "discord_id": database.did(discord_id),
         "old_elo": old_elo,
@@ -902,21 +753,17 @@ def get_member_label(guild: discord.Guild | None, discord_id, fallback: str | No
         member = guild.get_member(discord_id)
         if member:
             return member.display_name[:80]
-
     return (fallback or str(discord_id))[:80]
 
 
 async def adjust_player_elo_only(discord_id: int, season_number: int | None, delta: int):
     await ensure_mm_player(discord_id)
-
     player = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(discord_id))
     if not player:
         return
-
     new_elo = max(0, player["elo"] + delta)
     elo_gained = delta if delta > 0 else 0
     elo_lost = abs(delta) if delta < 0 else 0
-
     await database.execute(
         """
         UPDATE mm_players
@@ -927,7 +774,6 @@ async def adjust_player_elo_only(discord_id: int, season_number: int | None, del
         """,
         new_elo, elo_gained, elo_lost, database.did(discord_id),
     )
-
     if season_number is not None:
         await ensure_mm_season_player(season_number, discord_id)
         await database.execute(
@@ -946,43 +792,63 @@ async def replace_match_player(match_number: int, old_discord_id: int, new_disco
         "SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
         match_number, database.did(old_discord_id),
     )
-
     if not old_row:
         return False, "Old player not found."
-
     existing_new = await database.fetchone(
         "SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
         match_number, database.did(new_discord_id),
     )
-
     if existing_new:
         return False, "New player is already in this match."
-
     await database.execute(
         "UPDATE mm_match_players SET discord_id = $1 WHERE match_number = $2 AND discord_id = $3",
         database.did(new_discord_id), match_number, database.did(old_discord_id),
     )
-
     return True, None
 
 
 # =========================
 # COMPONENTS
 # =========================
-#
-# discord.ui component __init__ methods cannot be async (Discord.py does
-# not support it), so every component that needs DB data fetches it in
-# the *caller's* async context first, then passes it in as plain data.
 
 class JoinQueueView(discord.ui.View):
+    """
+    Queue join buttons. The critical fix here is that custom_ids are set
+    in __init__ — NOT inside the callback. Setting custom_id inside the
+    callback has no effect on Discord's side and breaks view persistence
+    after bot restarts, causing "application did not respond" errors.
+    """
+
     def __init__(self, cog: "MatchmakingCog", match_number: int):
         super().__init__(timeout=None)
         self.cog = cog
         self.match_number = match_number
 
-    async def refresh_message(self, interaction: discord.Interaction):
-        # Single query fetches all players — we reuse it to update button
-        # labels AND build the embed, avoiding 2 duplicate round-trips.
+        # Fix custom_ids now, in __init__, with the real match_number.
+        # The decorator sets a placeholder; we overwrite it immediately.
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.custom_id == "mm_join_setter_PLACEHOLDER":
+                    item.custom_id = f"mm_join_{ROLE_SETTER}_{match_number}"
+                elif item.custom_id == "mm_join_oh_PLACEHOLDER":
+                    item.custom_id = f"mm_join_{ROLE_OUTSIDE_HITTER}_{match_number}"
+                elif item.custom_id == "mm_join_mb_PLACEHOLDER":
+                    item.custom_id = f"mm_join_{ROLE_MIDDLE_BLOCKER}_{match_number}"
+                elif item.custom_id == "mm_join_op_PLACEHOLDER":
+                    item.custom_id = f"mm_join_{ROLE_OPPOSITE_HITTER}_{match_number}"
+                elif item.custom_id == "mm_leave_PLACEHOLDER":
+                    item.custom_id = f"mm_leave_{match_number}"
+
+    def _update_labels(self, counts: dict[str, int]) -> None:
+        for item in self.children:
+            if not isinstance(item, discord.ui.Button):
+                continue
+            for role in ROLE_ORDER:
+                if item.custom_id == f"mm_join_{role}_{self.match_number}":
+                    item.label = f"Join {ROLE_LABELS[role]} ({counts.get(role, 0)}/{ROLE_MAX_TOTAL[role]})"
+
+    async def refresh_message(self, interaction: discord.Interaction) -> None:
+        # One query does it all: update labels + build embed + check if full.
         rows = await database.fetchall(
             """
             SELECT discord_id, role_pref FROM mm_match_players
@@ -994,16 +860,11 @@ class JoinQueueView(discord.ui.View):
             self.match_number,
         )
 
-        # Update button labels from the same rows.
         counts: dict[str, int] = {role: 0 for role in ROLE_ORDER}
         for row in rows:
             if row["role_pref"] in counts:
                 counts[row["role_pref"]] += 1
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                for role in ROLE_ORDER:
-                    if item.custom_id == f"mm_join_{role}_{self.match_number}":
-                        item.label = f"Join {ROLE_LABELS[role]} ({counts[role]}/{ROLE_MAX_TOTAL[role]})"
+        self._update_labels(counts)
 
         total = len(rows)
 
@@ -1011,12 +872,11 @@ class JoinQueueView(discord.ui.View):
         if not match_row:
             return
 
-        # Once full, flip status to team_format_vote exactly once.
+        # Transition to team_format_vote exactly once when full.
         if total >= QUEUE_SIZE and match_row["status"] == "queue_open":
             await database.execute(
                 """
-                UPDATE mm_matches
-                SET status = 'team_format_vote'
+                UPDATE mm_matches SET status = 'team_format_vote'
                 WHERE match_number = $1 AND status = 'queue_open'
                 """,
                 self.match_number,
@@ -1027,14 +887,11 @@ class JoinQueueView(discord.ui.View):
             return
 
         if match_row["status"] == "team_format_vote":
-            existing_vote_view = self.cog.get_active_vote_view(self.match_number)
-            if existing_vote_view is not None:
-                random_votes, captains_votes = existing_vote_view._tally()
-                embed = build_team_format_vote_embed(
-                    match_row, random_votes, captains_votes,
-                    len(existing_vote_view.votes), total
-                )
-                await interaction.edit_original_response(embed=embed, view=existing_vote_view)
+            existing = self.cog.get_active_vote_view(self.match_number)
+            if existing is not None:
+                rv, cv = existing._tally()
+                embed = build_team_format_vote_embed(match_row, rv, cv, len(existing.votes), total)
+                await interaction.edit_original_response(embed=embed, view=existing)
             else:
                 vote_view = TeamFormatVoteView(self.cog, self.match_number, total)
                 embed = build_team_format_vote_embed(match_row, 0, 0, 0, total)
@@ -1051,13 +908,11 @@ class JoinQueueView(discord.ui.View):
             return
 
         if match_row["status"] == "queue_open":
-            # Build the embed using the rows already fetched — no extra query.
-            grouped: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
             guild = interaction.guild
+            grouped: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
             for row in rows:
                 line = f"{mention_or_name(guild, row['discord_id'])} `[{role_short(row['role_pref'])}]`"
                 grouped.setdefault(row["role_pref"], []).append(line)
-
             vip_queue = is_vip_queue(match_row)
             season_number = match_row["season_number"]
             embed = discord.Embed(
@@ -1071,19 +926,17 @@ class JoinQueueView(discord.ui.View):
             embed.set_footer(text=f"NVL Matchmaking • Season {season_number}" if season_number else "NVL Matchmaking")
             await interaction.edit_original_response(embed=embed, view=self)
 
-    async def _join_role(self, interaction: discord.Interaction, role_pref: str):
+    async def _join_role(self, interaction: discord.Interaction, role_pref: str) -> None:
         if not isinstance(interaction.user, discord.Member):
             return
 
-        # Acknowledge IMMEDIATELY — must be the very first await so
-        # Discord never times out the interaction before we respond.
+        # Acknowledge immediately — must be the very first await.
         await interaction.response.defer()
 
         lock = self.cog.get_match_lock(self.match_number)
 
         async with lock:
-            # Run the three independent read-queries in parallel to cut
-            # sequential Supabase round-trips from 4 down to 2.
+            # Parallel fetch: match state + existing row + VIP — 1 round instead of 3.
             match_row, existing_row, vip = await asyncio.gather(
                 get_match_by_number(self.match_number),
                 database.fetchone(
@@ -1118,20 +971,15 @@ class JoinQueueView(discord.ui.View):
                         f"The {ROLE_LABELS[role_pref]} queue is already full.", ephemeral=True
                     )
                     return
-
-                # VIP+ priority: can take a spot in a full position as
-                # long as the overall queue still has room.
                 total_row = await database.fetchone(
                     "SELECT COUNT(*) AS total FROM mm_match_players WHERE match_number = $1",
                     self.match_number,
                 )
-                total = total_row["total"] if total_row else 0
-                if total >= QUEUE_SIZE:
+                if (total_row["total"] if total_row else 0) >= QUEUE_SIZE:
                     await interaction.followup.send("This queue is already full.", ephemeral=True)
                     return
 
-            # Derive priority_weight from the VIP we already fetched —
-            # avoids calling get_active_vip a second time.
+            # Derive weight from already-fetched VIP — no extra query.
             priority_weight = (
                 vip_data.VIP_CAPTAIN_PRIORITY_WEIGHT.get(vip["tier"], 0) if vip else 0
             )
@@ -1150,43 +998,30 @@ class JoinQueueView(discord.ui.View):
                 await interaction.followup.send("You have already joined this queue.", ephemeral=True)
                 return
 
-            # Fire-and-forget — keeps profile fresh on the site without
-            # blocking the embed update.
+            # Profile upsert runs in background — doesn't block the embed update.
             asyncio.create_task(upsert_profile_from_member(interaction.user))
 
             await self.refresh_message(interaction)
 
-    @discord.ui.button(label="Join Setter (0/2)", style=discord.ButtonStyle.primary, custom_id="temp_setter", row=0)
+    # Buttons use stable placeholder custom_ids that __init__ overwrites immediately.
+    @discord.ui.button(label="Join Setter (0/2)", style=discord.ButtonStyle.primary, custom_id="mm_join_setter_PLACEHOLDER", row=0)
     async def join_setter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        button.custom_id = f"mm_join_{ROLE_SETTER}_{self.match_number}"
         await self._join_role(interaction, ROLE_SETTER)
 
-    @discord.ui.button(label="Join Outside Hitter (0/4)", style=discord.ButtonStyle.success, custom_id="temp_oh", row=0)
+    @discord.ui.button(label="Join Outside Hitter (0/4)", style=discord.ButtonStyle.success, custom_id="mm_join_oh_PLACEHOLDER", row=0)
     async def join_outside_hitter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        button.custom_id = f"mm_join_{ROLE_OUTSIDE_HITTER}_{self.match_number}"
         await self._join_role(interaction, ROLE_OUTSIDE_HITTER)
 
-    @discord.ui.button(label="Join Middle Blocker (0/4)", style=discord.ButtonStyle.success, custom_id="temp_mb", row=1)
+    @discord.ui.button(label="Join Middle Blocker (0/4)", style=discord.ButtonStyle.success, custom_id="mm_join_mb_PLACEHOLDER", row=1)
     async def join_middle_blocker(self, interaction: discord.Interaction, button: discord.ui.Button):
-        button.custom_id = f"mm_join_{ROLE_MIDDLE_BLOCKER}_{self.match_number}"
         await self._join_role(interaction, ROLE_MIDDLE_BLOCKER)
 
-    @discord.ui.button(label="Join Opposite Hitter (0/2)", style=discord.ButtonStyle.primary, custom_id="temp_op", row=1)
+    @discord.ui.button(label="Join Opposite Hitter (0/2)", style=discord.ButtonStyle.primary, custom_id="mm_join_op_PLACEHOLDER", row=1)
     async def join_opposite_hitter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        button.custom_id = f"mm_join_{ROLE_OPPOSITE_HITTER}_{self.match_number}"
         await self._join_role(interaction, ROLE_OPPOSITE_HITTER)
 
-    @discord.ui.button(
-        label="Leave Queue",
-        style=discord.ButtonStyle.danger,
-        custom_id="temp3",
-        row=2,
-    )
+    @discord.ui.button(label="Leave Queue", style=discord.ButtonStyle.danger, custom_id="mm_leave_PLACEHOLDER", row=2)
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        button.custom_id = f"mm_leave_queue_{self.match_number}"
-
-        # Ack immediately - two DB round-trips plus a delete precede the
-        # message refresh below.
         await interaction.response.defer()
 
         lock = self.cog.get_match_lock(self.match_number)
@@ -1198,10 +1033,9 @@ class JoinQueueView(discord.ui.View):
                 return
 
             row = await database.fetchone(
-                "SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
+                "SELECT 1 FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
                 self.match_number, database.did(interaction.user.id),
             )
-
             if not row:
                 await interaction.followup.send("You are not in this queue.", ephemeral=True)
                 return
@@ -1211,21 +1045,10 @@ class JoinQueueView(discord.ui.View):
                 self.match_number, database.did(interaction.user.id),
             )
 
-            # refresh_message handles labels + embed in 2 queries and uses
-            # edit_original_response — never interaction.message after defer().
             await self.refresh_message(interaction)
 
 
 class TeamFormatVoteView(discord.ui.View):
-    """
-    Shown once the queue fills, before captains/draft. Everyone in the
-    queue votes Random Teams vs Captain Picks; resolves as soon as
-    every queued player has voted, or after 30 seconds, whichever
-    comes first. A tie (including nobody voting at all) defaults to
-    Captain Picks, matching the format the queue always used before
-    this vote existed.
-    """
-
     def __init__(self, cog: "MatchmakingCog", match_number: int, total_players: int):
         super().__init__(timeout=30)
         self.cog = cog
@@ -1235,9 +1058,6 @@ class TeamFormatVoteView(discord.ui.View):
         self.message: discord.Message | None = None
         self.resolved = False
 
-        # Unique per match_number, same convention as JoinQueueView's
-        # join buttons - avoids any custom_id collision between two
-        # queues reaching this vote at the same time.
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 if item.custom_id == "mm_vote_random":
@@ -1254,8 +1074,6 @@ class TeamFormatVoteView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        # Ack immediately - up to two DB round-trips happen before the
-        # vote is even recorded below.
         await interaction.response.defer()
 
         lock = self.cog.get_match_lock(self.match_number)
@@ -1271,7 +1089,7 @@ class TeamFormatVoteView(discord.ui.View):
                 return
 
             player_row = await database.fetchone(
-                "SELECT 1 AS present FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
+                "SELECT 1 FROM mm_match_players WHERE match_number = $1 AND discord_id = $2",
                 self.match_number, database.did(interaction.user.id),
             )
             if not player_row:
@@ -1285,10 +1103,8 @@ class TeamFormatVoteView(discord.ui.View):
                 return
 
             if self.message:
-                random_votes, captains_votes = self._tally()
-                embed = build_team_format_vote_embed(
-                    match_row, random_votes, captains_votes, len(self.votes), self.total_players
-                )
+                rv, cv = self._tally()
+                embed = build_team_format_vote_embed(match_row, rv, cv, len(self.votes), self.total_players)
                 try:
                     await self.message.edit(embed=embed, view=self)
                 except discord.HTTPException:
@@ -1311,7 +1127,6 @@ class TeamFormatVoteView(discord.ui.View):
             await self._resolve(guild)
 
     async def _resolve(self, guild: discord.Guild | None):
-        # Caller must already hold self.cog.get_match_lock(self.match_number).
         if self.resolved:
             return
         self.resolved = True
@@ -1322,8 +1137,8 @@ class TeamFormatVoteView(discord.ui.View):
         if not match_row or match_row["status"] != "team_format_vote":
             return
 
-        random_votes, captains_votes = self._tally()
-        use_random = random_votes > captains_votes
+        rv, cv = self._tally()
+        use_random = rv > cv
 
         if use_random:
             await assign_random_teams(self.match_number)
@@ -1355,7 +1170,6 @@ class CaptainPickSelect(discord.ui.Select):
         self.cog = cog
         self.match_number = match_number
         self.slot = slot
-
         super().__init__(
             placeholder=f"Select Captain {slot}",
             min_values=1,
@@ -1369,30 +1183,22 @@ class CaptainPickSelect(discord.ui.Select):
             """
             SELECT * FROM mm_match_players
             WHERE match_number = $1
-            ORDER BY
-                priority_weight DESC,
+            ORDER BY priority_weight DESC,
                 CASE role_pref WHEN 'setter' THEN 0 WHEN 'outside_hitter' THEN 1 WHEN 'middle_blocker' THEN 2 WHEN 'opposite_hitter' THEN 3 ELSE 4 END,
                 id ASC
             """,
             match_row["match_number"],
         )
-
         selected_ids = {match_row["captain1_discord_id"], match_row["captain2_discord_id"]}
         selected_ids.discard(None)
-
-        # VIP/VIP+ players (weight > 0, captured at the moment they
-        # joined the queue) show up first and marked with a star - the
-        # VIP plan's "priority to be drawn as captain" benefit.
         options = []
         for row in all_players:
             if row["discord_id"] in selected_ids:
                 continue
-
             member_name = get_member_label(guild, row["discord_id"])
             role_name = role_label(row["role_pref"])
             weight = row["priority_weight"] or 0
             label = f"⭐ {member_name}" if weight > 0 else member_name
-
             options.append(
                 discord.SelectOption(
                     label=label[:100],
@@ -1400,19 +1206,15 @@ class CaptainPickSelect(discord.ui.Select):
                     description=(f"{role_name} • VIP priority" if weight > 0 else role_name)[:100],
                 )
             )
-
         return options
 
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can set captains.", ephemeral=True)
             return
 
-        # This can chain up to five sequential DB round-trips (plus a
-        # message fetch/edit) once both captains are set - ack right away.
         await interaction.response.defer(ephemeral=True)
 
         lock = self.cog.get_match_lock(self.match_number)
@@ -1424,7 +1226,6 @@ class CaptainPickSelect(discord.ui.Select):
                 return
 
             selected_discord_id = self.values[0]
-
             column = "captain1_discord_id" if self.slot == 1 else "captain2_discord_id"
             await database.execute(
                 f"UPDATE mm_matches SET {column} = $1 WHERE match_number = $2",
@@ -1435,24 +1236,19 @@ class CaptainPickSelect(discord.ui.Select):
 
             if match_row and match_row["captain1_discord_id"] and match_row["captain2_discord_id"]:
                 first_picker = random.choice([match_row["captain1_discord_id"], match_row["captain2_discord_id"]])
-
                 await database.execute(
                     "UPDATE mm_matches SET first_picker_discord_id = $1, status = 'draft' WHERE match_number = $2",
                     first_picker, self.match_number,
                 )
-
                 await database.execute(
                     "UPDATE mm_match_players SET team_side = 'A', captain = true, pick_order = 0 WHERE match_number = $1 AND discord_id = $2",
                     self.match_number, match_row["captain1_discord_id"],
                 )
-
                 await database.execute(
                     "UPDATE mm_match_players SET team_side = 'B', captain = true, pick_order = 0 WHERE match_number = $1 AND discord_id = $2",
                     self.match_number, match_row["captain2_discord_id"],
                 )
-
                 updated = await get_match_by_number(self.match_number)
-
                 if interaction.guild and updated and updated["queue_channel_id"] and updated["queue_message_id"]:
                     channel = interaction.guild.get_channel(int(updated["queue_channel_id"]))
                     if isinstance(channel, discord.TextChannel):
@@ -1466,16 +1262,7 @@ class CaptainPickSelect(discord.ui.Select):
                         except discord.HTTPException:
                             pass
 
-                await interaction.followup.send(
-                    f"Captain {self.slot} set successfully.",
-                    ephemeral=True
-                )
-                return
-
-            await interaction.followup.send(
-                f"Captain {self.slot} set successfully.",
-                ephemeral=True
-            )
+            await interaction.followup.send(f"Captain {self.slot} set successfully.", ephemeral=True)
 
 
 class CaptainPickView(discord.ui.View):
@@ -1495,34 +1282,20 @@ class CaptainSetupView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can set captains.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-
         match_row = await get_match_by_number(self.match_number)
         options = await CaptainPickSelect.build_options(match_row, interaction.guild)
-
-        await interaction.followup.send(
-            "Choose Captain 1:",
-            view=CaptainPickView(self.cog, self.match_number, 1, options),
-            ephemeral=True
-        )
+        await interaction.followup.send("Choose Captain 1:", view=CaptainPickView(self.cog, self.match_number, 1, options), ephemeral=True)
 
     @discord.ui.button(label="Set Captain 2", style=discord.ButtonStyle.secondary)
     async def set_captain_2(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can set captains.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-
         match_row = await get_match_by_number(self.match_number)
         options = await CaptainPickSelect.build_options(match_row, interaction.guild)
-
-        await interaction.followup.send(
-            "Choose Captain 2:",
-            view=CaptainPickView(self.cog, self.match_number, 2, options),
-            ephemeral=True
-        )
+        await interaction.followup.send("Choose Captain 2:", view=CaptainPickView(self.cog, self.match_number, 2, options), ephemeral=True)
 
 
 class PickPlayerButton(discord.ui.Button):
@@ -1540,9 +1313,6 @@ class PickPlayerButton(discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             return
 
-        # A draft pick can chain up to ~8 sequential DB round-trips
-        # before the embed/view are ready to show - ack immediately so
-        # a slow moment never shows "This interaction failed".
         await interaction.response.defer()
 
         match_row = await get_match_by_number(self.match_number)
@@ -1569,13 +1339,6 @@ class PickPlayerButton(discord.ui.Button):
             return
 
         role_pref = player_row["role_pref"]
-
-        # Normally this equals ROLE_MAX_TOTAL[role_pref] exactly (the
-        # queue caps enforce that on the way in). VIP+ priority joining
-        # can let a role go over its normal total though - in that case
-        # split it as evenly as possible between the two teams (ceil/2)
-        # instead of hard-blocking the extra player from ever being
-        # draftable, which would otherwise stall the draft forever.
         total_role_row = await database.fetchone(
             "SELECT COUNT(*) AS total FROM mm_match_players WHERE match_number = $1 AND role_pref = $2",
             self.match_number, role_pref,
@@ -1592,7 +1355,6 @@ class PickPlayerButton(discord.ui.Button):
             return
 
         pick_order = await get_pick_count(self.match_number) + 1
-
         await database.execute(
             "UPDATE mm_match_players SET team_side = $1, pick_order = $2 WHERE match_number = $3 AND discord_id = $4",
             captain_side, pick_order, self.match_number, self.player_discord_id,
@@ -1606,7 +1368,6 @@ class PickPlayerButton(discord.ui.Button):
                 self.match_number,
             )
             final_match = await get_match_by_number(self.match_number)
-
             await interaction.edit_original_response(
                 embed=await build_ready_embed(interaction.guild, final_match),
                 view=StartMatchView(self.cog, self.match_number)
@@ -1626,9 +1387,7 @@ class DraftView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.match_number = match_number
-
         guild = cog.bot.get_guild(config.GUILD_ID)
-
         for index, row in enumerate(available_players[:25]):
             member_name = get_member_label(guild, row["discord_id"])
             label = f"{member_name} [{role_short(row['role_pref'])}]"
@@ -1659,14 +1418,10 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
     async def on_submit(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can start the match.", ephemeral=True)
             return
 
-        # Creating three Discord channels below (one text + two voice)
-        # plus several DB round-trips easily takes well over 3 seconds -
-        # ack immediately.
         await interaction.response.defer()
 
         match_row = await get_match_by_number(self.match_number)
@@ -1685,7 +1440,6 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             return
 
         match_organizer_role = guild.get_role(MATCH_ORGANIZER_ROLE_ID)
-
         team_a = await get_team_players(self.match_number, "A")
         team_b = await get_team_players(self.match_number, "B")
 
@@ -1694,95 +1448,42 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
-
         if match_organizer_role:
-            overwrites_text[match_organizer_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
-
+            overwrites_text[match_organizer_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
         for row in team_a + team_b:
             member = guild.get_member(int(row["discord_id"]))
             if member:
                 overwrites_text[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
         text_channel = await guild.create_text_channel(
-            name=f"mm-{self.match_number}",
-            category=category,
-            overwrites=overwrites_text,
+            name=f"mm-{self.match_number}", category=category, overwrites=overwrites_text,
             reason=f"Matchmaking #{self.match_number} started by {interaction.user}"
         )
 
-        overwrites_team_a = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                connect=True,
-                manage_channels=True,
-                move_members=True
-            ),
-            interaction.user: discord.PermissionOverwrite(
-                view_channel=True,
-                connect=True,
-                move_members=True
-            ),
-        }
+        def base_voice_overwrites():
+            ow = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True, move_members=True),
+                interaction.user: discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True),
+            }
+            if match_organizer_role:
+                ow[match_organizer_role] = discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True, speak=True)
+            return ow
 
-        if match_organizer_role:
-            overwrites_team_a[match_organizer_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                connect=True,
-                move_members=True,
-                speak=True
-            )
-
-        overwrites_team_b = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                connect=True,
-                manage_channels=True,
-                move_members=True
-            ),
-            interaction.user: discord.PermissionOverwrite(
-                view_channel=True,
-                connect=True,
-                move_members=True
-            ),
-        }
-
-        if match_organizer_role:
-            overwrites_team_b[match_organizer_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                connect=True,
-                move_members=True,
-                speak=True
-            )
-
+        ow_a = base_voice_overwrites()
         for row in team_a:
             member = guild.get_member(int(row["discord_id"]))
             if member:
-                overwrites_team_a[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                ow_a[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
 
+        ow_b = base_voice_overwrites()
         for row in team_b:
             member = guild.get_member(int(row["discord_id"]))
             if member:
-                overwrites_team_b[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                ow_b[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
 
-        team_a_voice = await guild.create_voice_channel(
-            name=f"MM #{self.match_number} • Team A",
-            category=category,
-            overwrites=overwrites_team_a,
-            reason=f"Matchmaking #{self.match_number} Team A voice"
-        )
-
-        team_b_voice = await guild.create_voice_channel(
-            name=f"MM #{self.match_number} • Team B",
-            category=category,
-            overwrites=overwrites_team_b,
-            reason=f"Matchmaking #{self.match_number} Team B voice"
-        )
+        team_a_voice = await guild.create_voice_channel(name=f"MM #{self.match_number} • Team A", category=category, overwrites=ow_a)
+        team_b_voice = await guild.create_voice_channel(name=f"MM #{self.match_number} • Team B", category=category, overwrites=ow_b)
 
         is_special = random.random() < SPECIAL_MATCH_CHANCE
         special_multiplier = SPECIAL_MATCH_MULTIPLIER if is_special else 1
@@ -1790,39 +1491,20 @@ class PrivateServerModal(discord.ui.Modal, title="Start Match"):
         await database.execute(
             """
             UPDATE mm_matches
-            SET status = 'in_progress',
-                private_server_link = $1,
-                text_channel_id = $2,
-                team_a_voice_id = $3,
-                team_b_voice_id = $4,
-                is_special = $5,
-                special_multiplier = $6,
-                started_at = $7
+            SET status = 'in_progress', private_server_link = $1,
+                text_channel_id = $2, team_a_voice_id = $3, team_b_voice_id = $4,
+                is_special = $5, special_multiplier = $6, started_at = $7
             WHERE match_number = $8
             """,
             str(self.private_server_link),
-            database.did(text_channel.id),
-            database.did(team_a_voice.id),
-            database.did(team_b_voice.id),
-            is_special,
-            special_multiplier,
-            now(),
-            self.match_number,
+            database.did(text_channel.id), database.did(team_a_voice.id), database.did(team_b_voice.id),
+            is_special, special_multiplier, now(), self.match_number,
         )
 
         updated = await get_match_by_number(self.match_number)
-
         view = InProgressMatchView(self.cog, self.match_number)
-
-        await text_channel.send(
-            embed=await build_match_started_embed(guild, updated),
-            view=view
-        )
-
-        await interaction.edit_original_response(
-            embed=await build_match_started_embed(guild, updated),
-            view=view
-        )
+        await text_channel.send(embed=await build_match_started_embed(guild, updated), view=view)
+        await interaction.edit_original_response(embed=await build_match_started_embed(guild, updated), view=view)
 
 
 class StartMatchView(discord.ui.View):
@@ -1836,7 +1518,6 @@ class StartMatchView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can start the match.", ephemeral=True)
             return
-
         await interaction.response.send_modal(PrivateServerModal(self.cog, self.match_number))
 
 
@@ -1851,7 +1532,6 @@ class InProgressMatchView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can replace players.", ephemeral=True)
             return
-
         players = await get_match_players(self.match_number)
         await interaction.response.send_message(
             "Choose the player to replace:",
@@ -1864,20 +1544,11 @@ class InProgressMatchView(discord.ui.View):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can finish the match.", ephemeral=True)
             return
-
-        await interaction.response.send_message(
-            "Choose Winner Team:",
-            view=FinishWinnerTeamView(self.cog, self.match_number),
-            ephemeral=True
-        )
+        await interaction.response.send_message("Choose Winner Team:", view=FinishWinnerTeamView(self.cog, self.match_number), ephemeral=True)
 
 
 class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
-    new_player = discord.ui.TextInput(
-        label="New player mention or ID",
-        required=True,
-        placeholder="@user or user id"
-    )
+    new_player = discord.ui.TextInput(label="New player mention or ID", required=True, placeholder="@user or user id")
 
     def __init__(self, cog: "MatchmakingCog", match_number: int, old_discord_id: str):
         super().__init__()
@@ -1890,8 +1561,6 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
             await interaction.response.send_message("Only Match Organizer can replace players.", ephemeral=True)
             return
 
-        # Replacing a player chains several DB round-trips plus multiple
-        # Discord channel-permission edits - ack immediately.
         await interaction.response.defer(ephemeral=True)
 
         match_row = await get_match_by_number(self.match_number)
@@ -1901,7 +1570,6 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
 
         raw = str(self.new_player).strip()
         new_member = None
-
         if interaction.guild:
             if raw.startswith("<@") and raw.endswith(">"):
                 cleaned = raw.replace("<@", "").replace("!", "").replace(">", "")
@@ -1913,7 +1581,6 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
         if not new_member:
             await interaction.followup.send("Could not find that member in this server.", ephemeral=True)
             return
-
         if await is_user_busy(new_member.id):
             await interaction.followup.send("This player is already in another active queue/match.", ephemeral=True)
             return
@@ -1936,24 +1603,18 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
 
         await database.execute(
             """
-            INSERT INTO mm_replacements (
-                match_number, old_discord_id, new_discord_id, replaced_by_discord_id, penalty_applied
-            )
+            INSERT INTO mm_replacements (match_number, old_discord_id, new_discord_id, replaced_by_discord_id, penalty_applied)
             VALUES ($1, $2, $3, $4, $5)
             """,
-            self.match_number,
-            self.old_discord_id,
-            database.did(new_member.id),
-            database.did(interaction.user.id),
-            True,
+            self.match_number, self.old_discord_id, database.did(new_member.id), database.did(interaction.user.id), True,
         )
 
         await adjust_player_elo_only(old_discord_id_int, season_number, REPLACE_LEAVE_PENALTY)
-        await upsert_profile_from_member(new_member)
+        asyncio.create_task(upsert_profile_from_member(new_member))
 
         updated = await get_match_by_number(self.match_number)
-
         guild = interaction.guild
+
         if guild:
             old_member = guild.get_member(old_discord_id_int)
             team_side = old_row["team_side"]
@@ -1962,11 +1623,7 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
                 text_channel = guild.get_channel(int(updated["text_channel_id"]))
                 if isinstance(text_channel, discord.TextChannel):
                     try:
-                        await text_channel.set_permissions(
-                            new_member,
-                            view_channel=True,
-                            send_messages=True
-                        )
+                        await text_channel.set_permissions(new_member, view_channel=True, send_messages=True)
                         if old_member:
                             await text_channel.set_permissions(old_member, overwrite=None)
                     except discord.HTTPException:
@@ -1976,15 +1633,12 @@ class ReplacePlayerModal(discord.ui.Modal, title="Replace Player"):
             voice_channel = guild.get_channel(int(voice_channel_id)) if voice_channel_id else None
             if isinstance(voice_channel, discord.VoiceChannel):
                 try:
-                    await voice_channel.set_permissions(
-                        new_member,
-                        view_channel=True,
-                        connect=True
-                    )
+                    await voice_channel.set_permissions(new_member, view_channel=True, connect=True)
                     if old_member:
                         await voice_channel.set_permissions(old_member, overwrite=None)
                 except discord.HTTPException:
                     pass
+
             if updated["queue_channel_id"] and updated["queue_message_id"]:
                 queue_channel = guild.get_channel(int(updated["queue_channel_id"]))
                 if isinstance(queue_channel, discord.TextChannel):
@@ -2018,35 +1672,19 @@ class ReplacePlayerSelect(discord.ui.Select):
     def __init__(self, cog: "MatchmakingCog", match_number: int, players: list, guild: discord.Guild | None):
         self.cog = cog
         self.match_number = match_number
-
         options = []
         for row in players:
             label = get_member_label(guild, row["discord_id"])
             team_label = team_side_label(row["team_side"]) if row["team_side"] else "No Team"
-            options.append(
-                discord.SelectOption(
-                    label=label,
-                    value=row["discord_id"],
-                    description=f"{team_label} • {role_label(row['role_pref'])}"[:100]
-                )
-            )
-
-        super().__init__(
-            placeholder="Select the player to replace",
-            min_values=1,
-            max_values=1,
-            options=options[:25]
-        )
+            options.append(discord.SelectOption(label=label, value=row["discord_id"], description=f"{team_label} • {role_label(row['role_pref'])}"[:100]))
+        super().__init__(placeholder="Select the player to replace", min_values=1, max_values=1, options=options[:25])
 
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can replace players.", ephemeral=True)
             return
-
         old_discord_id = self.values[0]
-        await interaction.response.send_modal(
-            ReplacePlayerModal(self.cog, self.match_number, old_discord_id)
-        )
+        await interaction.response.send_modal(ReplacePlayerModal(self.cog, self.match_number, old_discord_id))
 
 
 class ReplacePlayerPickView(discord.ui.View):
@@ -2060,25 +1698,17 @@ class FinishWinnerTeamSelect(discord.ui.Select):
         self.cog = cog
         self.match_number = match_number
         super().__init__(
-            placeholder="Select Winner Team",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(label="Team A", value="A"),
-                discord.SelectOption(label="Team B", value="B"),
-            ]
+            placeholder="Select Winner Team", min_values=1, max_values=1,
+            options=[discord.SelectOption(label="Team A", value="A"), discord.SelectOption(label="Team B", value="B")]
         )
 
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can finish matches.", ephemeral=True)
             return
-
         winner_side = self.values[0]
         loser_side = "B" if winner_side == "A" else "A"
-
         winner_players = await get_team_players(self.match_number, winner_side)
-
         await interaction.response.edit_message(
             content=f"Winner Team: **{team_side_label(winner_side)}**\nNow choose Winner MVP.",
             view=FinishWmvpView(self.cog, self.match_number, winner_side, loser_side, winner_players, interaction.guild)
@@ -2097,34 +1727,14 @@ class FinishWmvpSelect(discord.ui.Select):
         self.match_number = match_number
         self.winner_side = winner_side
         self.loser_side = loser_side
-
-        options = [
-            discord.SelectOption(
-                label=get_member_label(guild, row["discord_id"]),
-                value=row["discord_id"],
-                description=role_label(row["role_pref"])[:100]
-            )
-            for row in players
-        ]
-
-        super().__init__(
-            placeholder="Select Winner MVP",
-            min_values=1,
-            max_values=1,
-            options=options[:25]
-        )
+        options = [discord.SelectOption(label=get_member_label(guild, row["discord_id"]), value=row["discord_id"], description=role_label(row["role_pref"])[:100]) for row in players]
+        super().__init__(placeholder="Select Winner MVP", min_values=1, max_values=1, options=options[:25])
 
     async def callback(self, interaction: discord.Interaction):
         wmvp_id = self.values[0]
-
         loser_players = await get_team_players(self.match_number, self.loser_side)
-
         await interaction.response.edit_message(
-            content=(
-                f"Winner Team: **{team_side_label(self.winner_side)}**\n"
-                f"Winner MVP selected.\n"
-                f"Now choose Loser MVP."
-            ),
+            content=f"Winner Team: **{team_side_label(self.winner_side)}**\nWinner MVP selected.\nNow choose Loser MVP.",
             view=FinishLmvpView(self.cog, self.match_number, self.winner_side, self.loser_side, wmvp_id, loser_players, interaction.guild)
         )
 
@@ -2142,39 +1752,16 @@ class FinishLmvpSelect(discord.ui.Select):
         self.winner_side = winner_side
         self.loser_side = loser_side
         self.wmvp_id = wmvp_id
-
-        options = [
-            discord.SelectOption(
-                label=get_member_label(guild, row["discord_id"]),
-                value=row["discord_id"],
-                description=role_label(row["role_pref"])[:100]
-            )
-            for row in players
-        ]
-
-        super().__init__(
-            placeholder="Select Loser MVP",
-            min_values=1,
-            max_values=1,
-            options=options[:25]
-        )
+        options = [discord.SelectOption(label=get_member_label(guild, row["discord_id"]), value=row["discord_id"], description=role_label(row["role_pref"])[:100]) for row in players]
+        super().__init__(placeholder="Select Loser MVP", min_values=1, max_values=1, options=options[:25])
 
     async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can finish matches.", ephemeral=True)
             return
-
         lmvp_id = self.values[0]
-
         await interaction.response.send_modal(
-            FinishScoreModal(
-                cog=self.cog,
-                match_number=self.match_number,
-                winner_side=self.winner_side,
-                loser_side=self.loser_side,
-                wmvp_id=self.wmvp_id,
-                lmvp_id=lmvp_id
-            )
+            FinishScoreModal(cog=self.cog, match_number=self.match_number, winner_side=self.winner_side, loser_side=self.loser_side, wmvp_id=self.wmvp_id, lmvp_id=lmvp_id)
         )
 
 
@@ -2186,21 +1773,11 @@ class FinishLmvpView(discord.ui.View):
 
 class FinishScoreModal(discord.ui.Modal, title="Finish Match"):
     final_score = discord.ui.TextInput(
-        label="Final Score (Team A - Team B)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        placeholder="Example: 25-20, 22-25, 15-11"
+        label="Final Score (Team A - Team B)", style=discord.TextStyle.paragraph,
+        required=True, placeholder="Example: 25-20, 22-25, 15-11"
     )
 
-    def __init__(
-        self,
-        cog: "MatchmakingCog",
-        match_number: int,
-        winner_side: str,
-        loser_side: str,
-        wmvp_id: str,
-        lmvp_id: str
-    ):
+    def __init__(self, cog: "MatchmakingCog", match_number: int, winner_side: str, loser_side: str, wmvp_id: str, lmvp_id: str):
         super().__init__()
         self.cog = cog
         self.match_number = match_number
@@ -2213,27 +1790,18 @@ class FinishScoreModal(discord.ui.Modal, title="Finish Match"):
         if not isinstance(interaction.user, discord.Member) or not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can finish matches.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-
         ok, error = await self.cog.finalize_match(
-            interaction=interaction,
-            match_number=self.match_number,
-            winner_side=self.winner_side,
-            loser_side=self.loser_side,
-            wmvp_id=self.wmvp_id,
-            lmvp_id=self.lmvp_id,
+            interaction=interaction, match_number=self.match_number,
+            winner_side=self.winner_side, loser_side=self.loser_side,
+            wmvp_id=self.wmvp_id, lmvp_id=self.lmvp_id,
             final_score_text=str(self.final_score).strip()
         )
-
         if not ok:
             await interaction.followup.send(error, ephemeral=True)
             return
+        await interaction.followup.send(f"Match #{self.match_number} finished successfully.", ephemeral=True)
 
-        await interaction.followup.send(
-            f"Match #{self.match_number} finished successfully.",
-            ephemeral=True
-        )
 
 # =========================
 # MAIN COG
@@ -2246,35 +1814,23 @@ TEAM_CHOICES = [
 
 
 class MatchmakingCog(commands.Cog):
-    mm = app_commands.Group(
-        name="mm",
-        description="Matchmaking commands",
-        guild_ids=[config.GUILD_ID]
-    )
-
-    season = app_commands.Group(
-        name="season",
-        description="Season commands",
-        guild_ids=[config.GUILD_ID]
-    )
+    mm = app_commands.Group(name="mm", description="Matchmaking commands", guild_ids=[config.GUILD_ID])
+    season = app_commands.Group(name="season", description="Season commands", guild_ids=[config.GUILD_ID])
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.match_locks: dict[int, asyncio.Lock] = {}
-        # One active TeamFormatVoteView per match. Prevents refresh_message
-        # from creating a duplicate view (and second 30-s timeout) when
-        # multiple players join at the same instant the queue fills.
-        self._active_vote_views: dict[int, "TeamFormatVoteView"] = {}
+        self._active_vote_views: dict[int, TeamFormatVoteView] = {}
 
     def get_match_lock(self, match_number: int) -> asyncio.Lock:
         if match_number not in self.match_locks:
             self.match_locks[match_number] = asyncio.Lock()
         return self.match_locks[match_number]
 
-    def register_vote_view(self, match_number: int, view: "TeamFormatVoteView") -> None:
+    def register_vote_view(self, match_number: int, view: TeamFormatVoteView) -> None:
         self._active_vote_views[match_number] = view
 
-    def get_active_vote_view(self, match_number: int) -> "TeamFormatVoteView | None":
+    def get_active_vote_view(self, match_number: int) -> TeamFormatVoteView | None:
         return self._active_vote_views.get(match_number)
 
     def unregister_vote_view(self, match_number: int) -> None:
@@ -2284,247 +1840,121 @@ class MatchmakingCog(commands.Cog):
     async def season_start(self, interaction: discord.Interaction, number: int):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_season(interaction.user):
             await interaction.response.send_message("Only Staff/Admin can start seasons.", ephemeral=True)
             return
-
-        # Up to three sequential DB round-trips follow - ack immediately.
         await interaction.response.defer()
-
         active = await get_active_season()
         if active:
-            await interaction.followup.send(
-                f"Season {active['number']} is already active.",
-                ephemeral=True
-            )
+            await interaction.followup.send(f"Season {active['number']} is already active.", ephemeral=True)
             return
-
         existing = await database.fetchone("SELECT * FROM mm_seasons WHERE number = $1", number)
         if existing:
-            await database.execute(
-                "UPDATE mm_seasons SET is_active = true, started_at = $1, ended_at = NULL WHERE number = $2",
-                now(), number,
-            )
+            await database.execute("UPDATE mm_seasons SET is_active = true, started_at = $1, ended_at = NULL WHERE number = $2", now(), number)
         else:
-            await database.execute(
-                "INSERT INTO mm_seasons (number, is_active, started_at, ended_at) VALUES ($1, true, $2, NULL)",
-                number, now(),
-            )
-
+            await database.execute("INSERT INTO mm_seasons (number, is_active, started_at, ended_at) VALUES ($1, true, $2, NULL)", number, now())
         await interaction.followup.send(f"Season {number} started successfully.")
 
     @season.command(name="end", description="Ends the active Matchmaking season")
     async def season_end(self, interaction: discord.Interaction, number: int):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_season(interaction.user):
             await interaction.response.send_message("Only Staff/Admin can end seasons.", ephemeral=True)
             return
-
-        # Up to three sequential DB round-trips follow - ack immediately.
         await interaction.response.defer()
-
         active = await get_active_season()
         if not active or active["number"] != number:
             await interaction.followup.send("This season is not the currently active season.", ephemeral=True)
             return
-
         active_match = await database.fetchone(
-            """
-            SELECT * FROM mm_matches
-            WHERE status IN ('queue_open', 'team_format_vote', 'captains_pending', 'draft', 'ready_to_start', 'in_progress')
-            LIMIT 1
-            """
+            "SELECT * FROM mm_matches WHERE status IN ('queue_open', 'team_format_vote', 'captains_pending', 'draft', 'ready_to_start', 'in_progress') LIMIT 1"
         )
         if active_match:
-            await interaction.followup.send(
-                "There is an active Matchmaking queue/match. Finish or cancel it before ending the season.",
-                ephemeral=True
-            )
+            await interaction.followup.send("There is an active Matchmaking queue/match. Finish or cancel it before ending the season.", ephemeral=True)
             return
-
-        await database.execute(
-            "UPDATE mm_seasons SET is_active = false, ended_at = $1 WHERE number = $2",
-            now(), number,
-        )
-
+        await database.execute("UPDATE mm_seasons SET is_active = false, ended_at = $1 WHERE number = $2", now(), number)
         await interaction.followup.send(f"Season {number} ended successfully.")
 
     @season.command(name="stats", description="Shows season stats")
     async def season_stats(self, interaction: discord.Interaction, number: int):
-        # Three sequential DB round-trips follow - ack immediately.
         await interaction.response.defer()
-
         season_row = await database.fetchone("SELECT * FROM mm_seasons WHERE number = $1", number)
         if not season_row:
             await interaction.followup.send("Season not found.", ephemeral=True)
             return
-
         top_rows = await database.fetchall(
-            """
-            SELECT *
-            FROM mm_season_players
-            WHERE season_number = $1
-            ORDER BY (elo_gained - elo_lost) DESC, wins DESC, matches DESC
-            LIMIT 10
-            """,
+            "SELECT * FROM mm_season_players WHERE season_number = $1 ORDER BY (elo_gained - elo_lost) DESC, wins DESC, matches DESC LIMIT 10",
             number,
         )
-
-        leaderboard_lines = []
         guild = interaction.guild
+        leaderboard_lines = []
         for index, row in enumerate(top_rows, start=1):
             net_elo = row["elo_gained"] - row["elo_lost"]
-            leaderboard_lines.append(
-                f"`#{index}` {mention_or_name(guild, row['discord_id'])} • Net `{net_elo}` • W-L `{row['wins']}-{row['losses']}` • Matches `{row['matches']}`"
-            )
-
-        total_matches_row = await database.fetchone(
-            "SELECT COUNT(*) AS total FROM mm_matches WHERE season_number = $1 AND status = 'finished'",
-            number,
-        )
+            leaderboard_lines.append(f"`#{index}` {mention_or_name(guild, row['discord_id'])} • Net `{net_elo}` • W-L `{row['wins']}-{row['losses']}` • Matches `{row['matches']}`")
+        total_matches_row = await database.fetchone("SELECT COUNT(*) AS total FROM mm_matches WHERE season_number = $1 AND status = 'finished'", number)
         total_matches = total_matches_row["total"] if total_matches_row else 0
-
-        embed = discord.Embed(
-            title=f"Season {number} Stats",
-            color=discord.Color.orange()
-        )
-        embed.add_field(
-            name="Status",
-            value="Active" if season_row["is_active"] else "Closed",
-            inline=True
-        )
-        embed.add_field(
-            name="Started",
-            value=str(season_row["started_at"]) if season_row["started_at"] else "—",
-            inline=True
-        )
-        embed.add_field(
-            name="Ended",
-            value=str(season_row["ended_at"]) if season_row["ended_at"] else "—",
-            inline=True
-        )
-        embed.add_field(
-            name="Finished Matches",
-            value=str(total_matches),
-            inline=False
-        )
-        embed.add_field(
-            name="Top 10 Leaderboard",
-            value=chr(10).join(leaderboard_lines) if leaderboard_lines else "No data yet.",
-            inline=False
-        )
-
+        embed = discord.Embed(title=f"Season {number} Stats", color=discord.Color.orange())
+        embed.add_field(name="Status", value="Active" if season_row["is_active"] else "Closed", inline=True)
+        embed.add_field(name="Started", value=str(season_row["started_at"]) if season_row["started_at"] else "—", inline=True)
+        embed.add_field(name="Ended", value=str(season_row["ended_at"]) if season_row["ended_at"] else "—", inline=True)
+        embed.add_field(name="Finished Matches", value=str(total_matches), inline=False)
+        embed.add_field(name="Top 10 Leaderboard", value=chr(10).join(leaderboard_lines) if leaderboard_lines else "No data yet.", inline=False)
         await interaction.followup.send(embed=embed)
 
     @mm.command(name="start", description="Starts a Matchmaking queue")
     async def mm_start(self, interaction: discord.Interaction, number: int):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can use this command.", ephemeral=True)
             return
-
-        # Everything below does several sequential database round-trips
-        # (and sometimes more, e.g. when clearing a cancelled match), which
-        # can add up to more than Discord's 3-second interaction window -
-        # especially with the bot on Discloud talking to Supabase over the
-        # network. Acknowledge immediately and use followups from here on
-        # so Discord never shows "The application did not respond" even
-        # though the match was actually created successfully.
         await interaction.response.defer()
-
         season_row = await get_active_season()
         if not season_row:
             await interaction.followup.send("There is no active season. Use /season start first.", ephemeral=True)
             return
-
         existing = await get_match_by_number(number)
         if existing:
             if existing["status"] == "cancelled":
                 await database.execute("DELETE FROM mm_match_players WHERE match_number = $1", number)
                 await database.execute("DELETE FROM mm_matches WHERE match_number = $1", number)
             else:
-                await interaction.followup.send(
-                    f"Match #{number} already exists with status `{existing['status']}`.",
-                    ephemeral=True
-                )
+                await interaction.followup.send(f"Match #{number} already exists with status `{existing['status']}`.", ephemeral=True)
                 return
-
         await database.execute(
-            """
-            INSERT INTO mm_matches (
-                match_number, season_number, status, created_by_discord_id,
-                queue_channel_id, queue_message_id
-            )
-            VALUES ($1, $2, 'queue_open', $3, $4, NULL)
-            """,
-            number,
-            season_row["number"],
-            database.did(interaction.user.id),
-            database.did(interaction.channel_id),
+            "INSERT INTO mm_matches (match_number, season_number, status, created_by_discord_id, queue_channel_id, queue_message_id) VALUES ($1, $2, 'queue_open', $3, $4, NULL)",
+            number, season_row["number"], database.did(interaction.user.id), database.did(interaction.channel_id),
         )
-
         match_row = await get_match_by_number(number)
         view = JoinQueueView(self, number)
-
         sent_message = await interaction.followup.send(
-            embed=await build_queue_embed(interaction.guild, match_row),
-            view=view,
-            wait=True,
+            embed=await build_queue_embed(interaction.guild, match_row), view=view, wait=True,
         )
-
-        await database.execute(
-            "UPDATE mm_matches SET queue_message_id = $1 WHERE match_number = $2",
-            database.did(sent_message.id), number,
-        )
+        await database.execute("UPDATE mm_matches SET queue_message_id = $1 WHERE match_number = $2", database.did(sent_message.id), number)
 
     @mm.command(name="cancel", description="Cancels a Matchmaking queue")
     async def mm_cancel(self, interaction: discord.Interaction, number: int):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
-            await interaction.response.send_message(
-                "Only Match Organizer can cancel the queue.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("Only Match Organizer can cancel the queue.", ephemeral=True)
             return
-
         match_row = await get_match_by_number(number)
         if not match_row:
             await interaction.response.send_message("Match not found.", ephemeral=True)
             return
-
         if match_row["status"] not in ("queue_open", "team_format_vote", "captains_pending", "draft", "ready_to_start", "in_progress"):
-            await interaction.response.send_message(
-                "Only active queues or in-progress matches can be cancelled.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("Only active queues or in-progress matches can be cancelled.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-
         await database.execute(
-            """
-            UPDATE mm_matches
-            SET status = 'cancelled',
-                finished_at = $1,
-                is_special = COALESCE(is_special, false),
-                special_multiplier = COALESCE(special_multiplier, 1)
-            WHERE match_number = $2
-            """,
+            "UPDATE mm_matches SET status = 'cancelled', finished_at = $1, is_special = COALESCE(is_special, false), special_multiplier = COALESCE(special_multiplier, 1) WHERE match_number = $2",
             now(), number,
         )
-
         previous_status = match_row["status"]
-
         updated = await get_match_by_number(number)
         guild = interaction.guild
-
         if guild is not None and updated["queue_channel_id"] and updated["queue_message_id"]:
             queue_channel = guild.get_channel(int(updated["queue_channel_id"]))
             if isinstance(queue_channel, discord.TextChannel):
@@ -2535,11 +1965,7 @@ class MatchmakingCog(commands.Cog):
                         if previous_status == "in_progress"
                         else await build_cancelled_embed(guild, updated, interaction.user.id)
                     )
-
-                    await queue_message.edit(
-                        embed=embed,
-                        view=None
-                    )
+                    await queue_message.edit(embed=embed, view=None)
                 except discord.HTTPException:
                     pass
             for channel_id in [updated["text_channel_id"], updated["team_a_voice_id"], updated["team_b_voice_id"]]:
@@ -2551,230 +1977,115 @@ class MatchmakingCog(commands.Cog):
                         await channel.delete(reason=f"Matchmaking #{number} cancelled")
                     except discord.HTTPException:
                         pass
-
-        await interaction.followup.send(
-            f"Matchmaking queue #{number} cancelled successfully.",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"Matchmaking queue #{number} cancelled successfully.", ephemeral=True)
 
     @mm.command(name="finish", description="Finishes an in-progress Matchmaking match")
     @app_commands.choices(winner_team=TEAM_CHOICES, loser_team=TEAM_CHOICES)
-    async def mm_finish(
-        self,
-        interaction: discord.Interaction,
-        number: int,
-        winner_team: app_commands.Choice[str],
-        loser_team: app_commands.Choice[str],
-        wmvp: discord.Member,
-        lmvp: discord.Member,
-        final_score: str
-    ):
+    async def mm_finish(self, interaction: discord.Interaction, number: int, winner_team: app_commands.Choice[str], loser_team: app_commands.Choice[str], wmvp: discord.Member, lmvp: discord.Member, final_score: str):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can finish the match.", ephemeral=True)
             return
-
         if winner_team.value == loser_team.value:
             await interaction.response.send_message("Winner team and loser team must be different.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-
         ok, error = await self.finalize_match(
-            interaction=interaction,
-            match_number=number,
-            winner_side=winner_team.value,
-            loser_side=loser_team.value,
-            wmvp_id=database.did(wmvp.id),
-            lmvp_id=database.did(lmvp.id),
-            final_score_text=final_score
+            interaction=interaction, match_number=number,
+            winner_side=winner_team.value, loser_side=loser_team.value,
+            wmvp_id=database.did(wmvp.id), lmvp_id=database.did(lmvp.id), final_score_text=final_score
         )
-
         if not ok:
             await interaction.followup.send(error, ephemeral=True)
             return
-
         await interaction.followup.send(f"Match #{number} finished successfully.", ephemeral=True)
 
     @mm.command(name="elo", description="Shows your Matchmaking ELO")
     async def mm_elo(self, interaction: discord.Interaction, member: discord.Member | None = None):
         target = member or interaction.user
-
-        # Up to five sequential DB round-trips follow - ack immediately.
         await interaction.response.defer()
-
         await ensure_mm_player(target.id)
-        row = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(target.id))
-        season_row = await get_active_season()
-        vip = await vip_data.get_active_vip(target.id)
-        vip_suffix = f" • {vip_data.vip_tier_label(vip['tier'])}" if vip else ""
-
-        embed = discord.Embed(
-            title=f"{target.display_name} • MM Profile{vip_suffix}",
-            color=discord.Color.gold() if vip else discord.Color.blurple()
+        row, season_row, vip = await asyncio.gather(
+            database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(target.id)),
+            get_active_season(),
+            vip_data.get_active_vip(target.id),
         )
+        vip_suffix = f" • {vip_data.vip_tier_label(vip['tier'])}" if vip else ""
+        embed = discord.Embed(title=f"{target.display_name} • MM Profile{vip_suffix}", color=discord.Color.gold() if vip else discord.Color.blurple())
         embed.add_field(name="ELO", value=str(row["elo"]), inline=True)
         embed.add_field(name="Matches", value=str(row["matches"]), inline=True)
         embed.add_field(name="W-L", value=f"{row['wins']}-{row['losses']}", inline=True)
         embed.add_field(name="Win MVP", value=str(row["win_mvp"]), inline=True)
         embed.add_field(name="Loss MVP", value=str(row["loss_mvp"]), inline=True)
-        embed.add_field(
-            name="Total ELO",
-            value=f"+{row['elo_gained_total']} / -{row['elo_lost_total']}",
-            inline=True
-        )
-
+        embed.add_field(name="Total ELO", value=f"+{row['elo_gained_total']} / -{row['elo_lost_total']}", inline=True)
         if season_row:
             season_player = await database.fetchone(
                 "SELECT * FROM mm_season_players WHERE season_number = $1 AND discord_id = $2",
                 season_row["number"], database.did(target.id),
             )
-
             if season_player:
-                embed.add_field(
-                    name=f"Season {season_row['number']}",
-                    value=(
-                        f"Matches: `{season_player['matches']}`\n"
-                        f"W-L: `{season_player['wins']}-{season_player['losses']}`\n"
-                        f"ELO: `+{season_player['elo_gained']} / -{season_player['elo_lost']}`"
-                    ),
-                    inline=False
-                )
-
+                embed.add_field(name=f"Season {season_row['number']}", value=f"Matches: `{season_player['matches']}`\nW-L: `{season_player['wins']}-{season_player['losses']}`\nELO: `+{season_player['elo_gained']} / -{season_player['elo_lost']}`", inline=False)
         await interaction.followup.send(embed=embed)
 
-    async def finalize_match(
-        self,
-        interaction: discord.Interaction,
-        match_number: int,
-        winner_side: str,
-        loser_side: str,
-        wmvp_id: str,
-        lmvp_id: str,
-        final_score_text: str
-    ):
+    async def finalize_match(self, interaction: discord.Interaction, match_number: int, winner_side: str, loser_side: str, wmvp_id: str, lmvp_id: str, final_score_text: str):
         match_row = await get_match_by_number(match_number)
         if not match_row:
             return False, "Match not found."
-
         if match_row["status"] != "in_progress":
             return False, "This match is not currently in progress."
-
         set_scores, parse_error = parse_final_score(final_score_text)
         if parse_error:
             return False, parse_error
-
         elo_calc, elo_error = calculate_match_team_deltas(set_scores, winner_side)
         if elo_error:
             return False, elo_error
-
-        wmvp_row = await database.fetchone(
-            "SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2 AND team_side = $3",
-            match_number, wmvp_id, winner_side,
-        )
-
-        lmvp_row = await database.fetchone(
-            "SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2 AND team_side = $3",
-            match_number, lmvp_id, loser_side,
-        )
-
+        wmvp_row = await database.fetchone("SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2 AND team_side = $3", match_number, wmvp_id, winner_side)
+        lmvp_row = await database.fetchone("SELECT * FROM mm_match_players WHERE match_number = $1 AND discord_id = $2 AND team_side = $3", match_number, lmvp_id, loser_side)
         if not wmvp_row:
             return False, "WMVP must belong to the winner team."
-
         if not lmvp_row:
             return False, "LMVP must belong to the loser team."
-
         players = await get_match_players(match_number)
         season_number = match_row["season_number"]
         elo_changes: list[dict] = []
-
         base_winner_delta = elo_calc["winner_delta"]
         base_loser_delta = elo_calc["loser_delta"]
         normalized_final_score = elo_calc["final_score_display"]
-
         special_multiplier = match_row["special_multiplier"] or 1
         special = is_special_match(match_row)
         vip_queue = is_vip_queue(match_row)
-
-        # VIP queue channel: wins are worth double ELO. Stacks with the
-        # Golden Match multiplier and with each winner's own VIP % bonus
-        # (applied per-player further below) - by design, per Meds.
         if vip_queue:
             base_winner_delta *= VIP_QUEUE_ELO_MULTIPLIER
-
         if special:
             base_winner_delta *= special_multiplier
-
         for row in players:
             is_winner = row["team_side"] == winner_side
-            # VIP/VIP+ ELO bonus only applies to the winner's gain
-            # (it never reduces the loser's loss, even if they are VIP).
             vip = await vip_data.get_active_vip(row["discord_id"]) if is_winner else None
-
             if is_winner:
                 base_delta = base_winner_delta + (WMVP_BONUS if row["discord_id"] == wmvp_id else 0)
                 multiplier = (1.0 + vip_data.VIP_ELO_WIN_BONUS_PERCENT.get(vip["tier"], 0.0)) if vip else 1.0
                 delta = round(base_delta * multiplier)
-                result = await apply_match_result_to_player(
-                    discord_id=int(row["discord_id"]),
-                    season_number=season_number,
-                    delta=delta,
-                    is_win=True,
-                    is_win_mvp=(row["discord_id"] == wmvp_id),
-                    is_loss_mvp=False
-                )
+                result = await apply_match_result_to_player(discord_id=int(row["discord_id"]), season_number=season_number, delta=delta, is_win=True, is_win_mvp=(row["discord_id"] == wmvp_id), is_loss_mvp=False)
             else:
                 delta = base_loser_delta + (LMVP_REDUCTION if row["discord_id"] == lmvp_id else 0)
-                result = await apply_match_result_to_player(
-                    discord_id=int(row["discord_id"]),
-                    season_number=season_number,
-                    delta=delta,
-                    is_win=False,
-                    is_win_mvp=False,
-                    is_loss_mvp=(row["discord_id"] == lmvp_id)
-                )
-
+                result = await apply_match_result_to_player(discord_id=int(row["discord_id"]), season_number=season_number, delta=delta, is_win=False, is_win_mvp=False, is_loss_mvp=(row["discord_id"] == lmvp_id))
             if result:
                 result["vip_tier"] = vip["tier"] if vip else None
                 elo_changes.append(result)
-
         await database.execute(
-            """
-            UPDATE mm_matches
-            SET status = 'finished',
-                winner_side = $1,
-                loser_side = $2,
-                wmvp_discord_id = $3,
-                lmvp_discord_id = $4,
-                final_score_text = $5,
-                finished_at = $6
-            WHERE match_number = $7
-            """,
-            winner_side,
-            loser_side,
-            wmvp_id,
-            lmvp_id,
-            normalized_final_score,
-            now(),
-            match_number,
+            "UPDATE mm_matches SET status = 'finished', winner_side = $1, loser_side = $2, wmvp_discord_id = $3, lmvp_discord_id = $4, final_score_text = $5, finished_at = $6 WHERE match_number = $7",
+            winner_side, loser_side, wmvp_id, lmvp_id, normalized_final_score, now(), match_number,
         )
-
         updated = await get_match_by_number(match_number)
         guild = interaction.guild
-
         if guild is not None:
             results_channel = guild.get_channel(MM_RESULTS_CHANNEL_ID)
             if isinstance(results_channel, discord.TextChannel):
                 await results_channel.send(embed=await build_result_embed(guild, updated))
-
             elo_update_channel = guild.get_channel(ELO_UPDATE_CHANNEL_ID)
             if isinstance(elo_update_channel, discord.TextChannel):
-                await elo_update_channel.send(
-                    embed=await build_elo_update_embed(guild, updated, elo_changes)
-                )
-
+                await elo_update_channel.send(embed=await build_elo_update_embed(guild, updated, elo_changes))
             if updated["queue_channel_id"] and updated["queue_message_id"]:
                 queue_channel = guild.get_channel(int(updated["queue_channel_id"]))
                 if isinstance(queue_channel, discord.TextChannel):
@@ -2783,7 +2094,6 @@ class MatchmakingCog(commands.Cog):
                         await queue_message.edit(embed=await build_result_embed(guild, updated), view=None)
                     except discord.HTTPException:
                         pass
-
             for channel_id in [updated["text_channel_id"], updated["team_a_voice_id"], updated["team_b_voice_id"]]:
                 if not channel_id:
                     continue
@@ -2793,182 +2103,69 @@ class MatchmakingCog(commands.Cog):
                         await channel.delete(reason=f"Matchmaking #{match_number} finished")
                     except discord.HTTPException:
                         pass
-
         return True, None
-
 
     @mm.command(name="leaderboard", description="Shows the Matchmaking leaderboard")
     async def mm_leaderboard(self, interaction: discord.Interaction, page: int = 1, season_number: int | None = None):
         if page < 1:
             await interaction.response.send_message("Page must be 1 or greater.", ephemeral=True)
             return
-
-        # Two sequential DB round-trips follow - ack immediately.
         await interaction.response.defer()
-
         per_page = 10
         offset = (page - 1) * per_page
         guild = interaction.guild
-
         if season_number is None:
-            rows = await database.fetchall(
-                """
-                SELECT *
-                FROM mm_players
-                ORDER BY elo DESC, wins DESC, matches DESC
-                LIMIT $1 OFFSET $2
-                """,
-                per_page, offset,
-            )
-
+            rows = await database.fetchall("SELECT * FROM mm_players ORDER BY elo DESC, wins DESC, matches DESC LIMIT $1 OFFSET $2", per_page, offset)
             title = "MM Global Leaderboard"
-            lines = []
-            start_rank = offset + 1
             vip_by_discord_id = await get_vip_badges_for([row["discord_id"] for row in rows])
-
-            for i, row in enumerate(rows, start=start_rank):
-                badge = vip_by_discord_id.get(row["discord_id"], "")
-                lines.append(
-                    f"`#{i}` {mention_or_name(guild, row['discord_id'])}{badge} • ELO `{row['elo']}` • W-L `{row['wins']}-{row['losses']}` • M `{row['matches']}`"
-                )
+            lines = [f"`#{offset+1+i}` {mention_or_name(guild, row['discord_id'])}{vip_by_discord_id.get(row['discord_id'], '')} • ELO `{row['elo']}` • W-L `{row['wins']}-{row['losses']}` • M `{row['matches']}`" for i, row in enumerate(rows)]
         else:
-            rows = await database.fetchall(
-                """
-                SELECT *
-                FROM mm_season_players
-                WHERE season_number = $1
-                ORDER BY (elo_gained - elo_lost) DESC, wins DESC, matches DESC
-                LIMIT $2 OFFSET $3
-                """,
-                season_number, per_page, offset,
-            )
-
+            rows = await database.fetchall("SELECT * FROM mm_season_players WHERE season_number = $1 ORDER BY (elo_gained - elo_lost) DESC, wins DESC, matches DESC LIMIT $2 OFFSET $3", season_number, per_page, offset)
             title = f"MM Season {season_number} Leaderboard"
-            lines = []
-            start_rank = offset + 1
             vip_by_discord_id = await get_vip_badges_for([row["discord_id"] for row in rows])
-
-            for i, row in enumerate(rows, start=start_rank):
-                net = row["elo_gained"] - row["elo_lost"]
-                badge = vip_by_discord_id.get(row["discord_id"], "")
-                lines.append(
-                    f"`#{i}` {mention_or_name(guild, row['discord_id'])}{badge} • Net `{net}` • W-L `{row['wins']}-{row['losses']}` • M `{row['matches']}`"
-                )
-
-        embed = discord.Embed(
-            title=title,
-            description=chr(10).join(lines) if lines else "No data found for this page.",
-            color=discord.Color.gold()
-        )
+            lines = [f"`#{offset+1+i}` {mention_or_name(guild, row['discord_id'])}{vip_by_discord_id.get(row['discord_id'], '')} • Net `{row['elo_gained']-row['elo_lost']}` • W-L `{row['wins']}-{row['losses']}` • M `{row['matches']}`" for i, row in enumerate(rows)]
+        embed = discord.Embed(title=title, description=chr(10).join(lines) if lines else "No data found for this page.", color=discord.Color.gold())
         embed.set_footer(text=f"Page {page}")
         await interaction.followup.send(embed=embed)
-
 
     @mm.command(name="vip", description="Shows Matchmaking VIP/VIP+ pricing and benefits")
     async def mm_vip(self, interaction: discord.Interaction):
         my_vip = await vip_data.get_active_vip(interaction.user.id)
-
-        embed = discord.Embed(
-            title="NVL Matchmaking — VIP & VIP+",
-            description=(
-                f"Buy it on the site: {config.NVL_SITE_URL}/matchmaking#vip\n"
-                "Payment via Pix, processed by Stripe. Valid for "
-                f"{vip_data.VIP_DURATION_DAYS} days from confirmation."
-            ),
-            color=discord.Color.gold()
-        )
-        embed.add_field(
-            name=f"VIP — {vip_data.VIP_PRICING['vip']['label']} / 30 days",
-            value=(
-                f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip'] * 100)}% ELO gained on wins\n"
-                "• Exclusive Discord role + VIP badge on the leaderboard (site and `/mm leaderboard`)\n"
-                "• Access to the VIP queue channel - wins there are worth **2x ELO**"
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name=f"VIP+ — {vip_data.VIP_PRICING['vip_plus']['label']} / 30 days",
-            value=(
-                f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip_plus'] * 100)}% ELO gained on wins\n"
-                "• Priority queue join - can take any position, even a full one, "
-                "as long as the overall queue isn't full and picks haven't started\n"
-                "• Exclusive Discord role + VIP badge on the leaderboard (site and `/mm leaderboard`)\n"
-                "• Access to the VIP queue channel - wins there are worth **2x ELO**"
-            ),
-            inline=False
-        )
-
+        embed = discord.Embed(title="NVL Matchmaking — VIP & VIP+", description=f"Buy it on the site: {config.NVL_SITE_URL}/matchmaking#vip\nPayment via Pix, processed by Stripe. Valid for {vip_data.VIP_DURATION_DAYS} days from confirmation.", color=discord.Color.gold())
+        embed.add_field(name=f"VIP — {vip_data.VIP_PRICING['vip']['label']} / 30 days", value=f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip'] * 100)}% ELO gained on wins\n• Exclusive Discord role + VIP badge on the leaderboard (site and `/mm leaderboard`)\n• Access to the VIP queue channel - wins there are worth **2x ELO**", inline=False)
+        embed.add_field(name=f"VIP+ — {vip_data.VIP_PRICING['vip_plus']['label']} / 30 days", value=f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip_plus'] * 100)}% ELO gained on wins\n• Priority queue join - can take any position, even a full one, as long as the overall queue isn't full and picks haven't started\n• Exclusive Discord role + VIP badge on the leaderboard (site and `/mm leaderboard`)\n• Access to the VIP queue channel - wins there are worth **2x ELO**", inline=False)
         if my_vip:
-            embed.add_field(
-                name="Your status",
-                value=f"You are **{vip_data.vip_tier_label(my_vip['tier'])}** until `{my_vip['expires_at']}`.",
-                inline=False
-            )
+            embed.add_field(name="Your status", value=f"You are **{vip_data.vip_tier_label(my_vip['tier'])}** until `{my_vip['expires_at']}`.", inline=False)
         else:
             embed.add_field(name="Your status", value="You do not have an active VIP subscription right now.", inline=False)
-
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @mm.command(name="addvip", description="Manually grants VIP or VIP+ to a player (no site purchase)")
-    @app_commands.describe(
-        player="Player to grant VIP to",
-        tier="VIP or VIP+",
-        days="Duration in days (defaults to the site's standard 30 days)"
-    )
-    @app_commands.choices(tier=[
-        app_commands.Choice(name="VIP", value="vip"),
-        app_commands.Choice(name="VIP+", value="vip_plus"),
-    ])
-    async def mm_addvip(
-        self,
-        interaction: discord.Interaction,
-        player: discord.Member,
-        tier: app_commands.Choice[str],
-        days: int = vip_data.VIP_DURATION_DAYS,
-    ):
+    @app_commands.describe(player="Player to grant VIP to", tier="VIP or VIP+", days="Duration in days (defaults to the site's standard 30 days)")
+    @app_commands.choices(tier=[app_commands.Choice(name="VIP", value="vip"), app_commands.Choice(name="VIP+", value="vip_plus")])
+    async def mm_addvip(self, interaction: discord.Interaction, player: discord.Member, tier: app_commands.Choice[str], days: int = vip_data.VIP_DURATION_DAYS):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not is_admin(interaction.user):
             await interaction.response.send_message("Only Administrator can grant VIP manually.", ephemeral=True)
             return
-
         if days <= 0:
             await interaction.response.send_message("Days must be greater than 0.", ephemeral=True)
             return
-
         await interaction.response.defer()
-
         await upsert_profile_from_member(player)
-
         tier_value = tier.value
         expires_at = now() + timedelta(days=days)
-
-        # Recorded as a $0 "admin_grant" payment (rather than skipping
-        # vip_payments entirely) so there's an audit trail of who
-        # manually granted VIP and when, same as a real purchase would
-        # leave behind.
         async with database.transaction() as conn:
             payment_row = await conn.fetchrow(
-                """
-                INSERT INTO vip_payments (discord_id, tier, amount_cents, provider, status, paid_at)
-                VALUES ($1, $2, 0, 'admin_grant', 'paid', $3)
-                RETURNING id
-                """,
+                "INSERT INTO vip_payments (discord_id, tier, amount_cents, provider, status, paid_at) VALUES ($1, $2, 0, 'admin_grant', 'paid', $3) RETURNING id",
                 database.did(player.id), tier_value, now(),
             )
+            await conn.execute("UPDATE vip_subscriptions SET status = 'cancelled' WHERE discord_id = $1 AND status = 'active'", database.did(player.id))
             await conn.execute(
-                "UPDATE vip_subscriptions SET status = 'cancelled' WHERE discord_id = $1 AND status = 'active'",
-                database.did(player.id),
-            )
-            await conn.execute(
-                """
-                INSERT INTO vip_subscriptions (discord_id, tier, status, source_payment_id, role_applied, expires_at)
-                VALUES ($1, $2, 'active', $3, true, $4)
-                """,
+                "INSERT INTO vip_subscriptions (discord_id, tier, status, source_payment_id, role_applied, expires_at) VALUES ($1, $2, 'active', $3, true, $4)",
                 database.did(player.id), tier_value, payment_row["id"], expires_at,
             )
-
         if interaction.guild:
             role_id = config.VIP_PLUS_ROLE_ID if tier_value == "vip_plus" else config.VIP_ROLE_ID
             other_role_id = config.VIP_ROLE_ID if tier_value == "vip_plus" else config.VIP_PLUS_ROLE_ID
@@ -2981,70 +2178,43 @@ class MatchmakingCog(commands.Cog):
                     await player.remove_roles(other_role, reason="Tier changed via /mm addvip")
             except discord.Forbidden:
                 pass
-
-        await interaction.followup.send(
-            f"{player.mention} is now **{vip_data.vip_tier_label(tier_value)}** until "
-            f"{expires_at.strftime('%d/%m/%Y %H:%M')} BRT (granted manually by {interaction.user.mention})."
-        )
+        await interaction.followup.send(f"{player.mention} is now **{vip_data.vip_tier_label(tier_value)}** until {expires_at.strftime('%d/%m/%Y %H:%M')} BRT (granted manually by {interaction.user.mention}).")
 
     @mm.command(name="addelo", description="Adds Matchmaking ELO to a player")
     async def mm_addelo(self, interaction: discord.Interaction, elo: int, user: discord.Member):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can adjust ELO.", ephemeral=True)
             return
-
         if elo <= 0:
             await interaction.response.send_message("ELO must be greater than 0.", ephemeral=True)
             return
-
-        # adjust_player_elo_only alone can chain up to five DB round-trips -
-        # ack immediately.
         await interaction.response.defer(ephemeral=True)
-
         season_row = await get_active_season()
         season_number = season_row["number"] if season_row else None
-
         await adjust_player_elo_only(user.id, season_number, elo)
         row = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(user.id))
-        await upsert_profile_from_member(user)
-
-        await interaction.followup.send(
-            f"Added `{elo}` ELO to {user.mention}. New ELO: `{row['elo']}`",
-            ephemeral=True
-        )
-
+        asyncio.create_task(upsert_profile_from_member(user))
+        await interaction.followup.send(f"Added `{elo}` ELO to {user.mention}. New ELO: `{row['elo']}`", ephemeral=True)
 
     @mm.command(name="removeelo", description="Removes Matchmaking ELO from a player")
     async def mm_removeelo(self, interaction: discord.Interaction, elo: int, user: discord.Member):
         if not isinstance(interaction.user, discord.Member):
             return
-
         if not can_manage_matchmaking(interaction.user):
             await interaction.response.send_message("Only Match Organizer can adjust ELO.", ephemeral=True)
             return
-
         if elo <= 0:
             await interaction.response.send_message("ELO must be greater than 0.", ephemeral=True)
             return
-
-        # adjust_player_elo_only alone can chain up to five DB round-trips -
-        # ack immediately.
         await interaction.response.defer(ephemeral=True)
-
         season_row = await get_active_season()
         season_number = season_row["number"] if season_row else None
-
         await adjust_player_elo_only(user.id, season_number, -elo)
         row = await database.fetchone("SELECT * FROM mm_players WHERE discord_id = $1", database.did(user.id))
-        await upsert_profile_from_member(user)
-
-        await interaction.followup.send(
-            f"Removed `{elo}` ELO from {user.mention}. New ELO: `{row['elo']}`",
-            ephemeral=True
-        )
+        asyncio.create_task(upsert_profile_from_member(user))
+        await interaction.followup.send(f"Removed `{elo}` ELO from {user.mention}. New ELO: `{row['elo']}`", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
