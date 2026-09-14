@@ -97,6 +97,28 @@ async def fetchall(query: str, *params: Any) -> list[asyncpg.Record]:
         return await c.fetch(query, *params)
 
 
+
+async def insert_returning(table: str, values: dict[str, Any]) -> asyncpg.Record | None:
+    """Insert a row and return the created record.
+
+    Used by features that need the generated primary key after an insert.
+    Table/column names come from internal bot code, not user input.
+    """
+    if not values:
+        raise ValueError("insert_returning requires values.")
+
+    columns = list(values.keys())
+    placeholders = ", ".join(f"${i}" for i in range(1, len(columns) + 1))
+    column_sql = ", ".join(columns)
+    query = (
+        f"INSERT INTO {table} ({column_sql}) "
+        f"VALUES ({placeholders}) "
+        "RETURNING *"
+    )
+
+    async with _require_pool().acquire() as c:
+        return await c.fetchrow(query, *[values[col] for col in columns])
+
 def did(value: Any) -> str | None:
     """Normalise a Discord snowflake to the text form used in every discord_id column."""
     if value is None:
