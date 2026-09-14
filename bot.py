@@ -12,6 +12,7 @@ EXTENSIONS = [
     "cogs.vip",
     "cogs.schedule",
     "cogs.match",
+    "cogs.referee_rating",
 ]
 # cogs.schedule (/schedule match|list|remove + 15-minute DM reminder loop)
 # and cogs.match (/match result) write directly to the shared "matches"

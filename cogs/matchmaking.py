@@ -63,11 +63,15 @@ BASE_WIN_ELO          = 22
 BASE_LOSS_ELO         = -14
 WMVP_BONUS            = 6
 LMVP_REDUCTION        = 6
-REPLACE_LEAVE_PENALTY = -10
+REPLACE_LEAVE_PENALTY = -30
 
 SPECIAL_MATCH_CHANCE     = 0.20
 SPECIAL_MATCH_MULTIPLIER = 3
 SPECIAL_MATCH_NAME       = "🏆 GOLDEN MATCH"
+
+# Win streak bonus: after N consecutive wins, apply extra ELO on each win
+STREAK_THRESHOLD = 3      # streak must reach this to activate bonus
+STREAK_BONUS_ELO = 5     # extra ELO per win while on a streak
 
 # Debounce window for queue embed updates.
 # Multiple clicks within this window collapse into one Discord API call.
@@ -331,12 +335,12 @@ def embed_queue(guild, match_row, rows) -> discord.Embed:
     e.set_footer(text=f"NVL Matchmaking • Season {sn}" if sn else "NVL Matchmaking")
     return e
 
-def embed_vote(match_row, rv: int, cv: int, voted: int, total: int) -> discord.Embed:
+def embed_vote(match_row, rv: int, cv: int, voted: int, total: int, seconds_left: int = 30) -> discord.Embed:
     e = discord.Embed(
         title=f"Queue #{match_row['match_number']} • Team Format Vote",
         description=(
             "The queue is full! Vote how teams should be formed.\n"
-            "Ends in 30 s or when everyone votes. Tie → **Captain Picks**."
+            f"Ends in **{seconds_left}s** or when everyone votes. Tie → **Captain Picks**."
         ),
         color=discord.Color.gold(),
     )
@@ -454,7 +458,10 @@ def embed_elo_update(guild, match_row, changes: list[dict]) -> discord.Embed:
         tags = []
         if ch["is_win_mvp"]:   tags.append("WMVP")
         if ch["is_loss_mvp"]:  tags.append("LMVP")
-        if ch.get("vip_tier"): tags.append(vip_data.vip_tier_label(ch["vip_tier"]))
+        if ch.get("vip_tier"):    tags.append(vip_data.vip_tier_label(ch["vip_tier"]))
+        streak = ch.get("win_streak", 0) or 0
+        if ch.get("streak_bonus") and ch["streak_bonus"] > 0:
+            tags.append(f"🔥 {streak}W Streak")
         suf  = f" ({', '.join(tags)})" if tags else ""
         line = f"{mention(guild, ch['discord_id'])}{suf} • `{format_delta(ch['delta'])}` → `{ch['new_elo']}`"
         (winners if ch["is_win"] else losers).append(line)
@@ -495,9 +502,21 @@ def embed_cancelled_ip(guild, match_row, team_a, team_b, by_id=None) -> discord.
 async def apply_elo(c, discord_id: str, season: int | None, delta: int,
                     is_win: bool, is_wmvp: bool, is_lmvp: bool) -> dict | None:
     await db_ensure_mm_player(c, discord_id)
-    player = await _q(c, "SELECT elo FROM mm_players WHERE discord_id = $1", discord_id)
+    player = await _q(c, "SELECT elo, win_streak FROM mm_players WHERE discord_id = $1", discord_id)
     if not player:
         return None
+
+    # Win streak bonus
+    current_streak = player["win_streak"] if player["win_streak"] is not None else 0
+    streak_bonus = 0
+    if is_win:
+        new_streak = current_streak + 1
+        if new_streak >= STREAK_THRESHOLD:
+            streak_bonus = STREAK_BONUS_ELO
+            delta += streak_bonus
+    else:
+        new_streak = 0
+
     old    = player["elo"]
     new    = max(0, old + delta)
     gained = max(0, delta)
@@ -506,12 +525,13 @@ async def apply_elo(c, discord_id: str, season: int | None, delta: int,
         UPDATE mm_players
         SET elo=$1, matches=matches+1, wins=wins+$2, losses=losses+$3,
             win_mvp=win_mvp+$4, loss_mvp=loss_mvp+$5,
-            elo_gained_total=elo_gained_total+$6, elo_lost_total=elo_lost_total+$7
-        WHERE discord_id=$8
+            elo_gained_total=elo_gained_total+$6, elo_lost_total=elo_lost_total+$7,
+            win_streak=$8
+        WHERE discord_id=$9
         """,
         new, int(is_win), int(not is_win),
         int(is_wmvp), int(is_lmvp),
-        gained, lost, discord_id)
+        gained, lost, new_streak, discord_id)
     if season is not None:
         await db_ensure_season_player(c, season, discord_id)
         await _x(c, """
@@ -524,6 +544,7 @@ async def apply_elo(c, discord_id: str, season: int | None, delta: int,
             int(is_win), int(not is_win), int(is_wmvp), int(is_lmvp),
             gained, lost, season, discord_id)
     return {"discord_id": discord_id, "old_elo": old, "new_elo": new, "delta": delta,
+            "streak_bonus": streak_bonus, "win_streak": new_streak,
             "is_win": is_win, "is_win_mvp": is_wmvp, "is_loss_mvp": is_lmvp}
 
 
@@ -754,17 +775,11 @@ class JoinQueueView(discord.ui.View):
                 elif await db_is_busy(c, uid):
                     error_msg = "You are already in another active queue/match."
                 else:
-                    is_vip_plus = bool(vip and vip["tier"] == "vip_plus")
                     rc_row      = await _q(c, "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1 AND role_pref=$2", self.mn, role)
                     role_count  = rc_row["n"] if rc_row else 0
 
                     if role_count >= ROLE_MAX_TOTAL[role]:
-                        if not is_vip_plus:
-                            error_msg = f"The {ROLE_LABELS[role]} slot is full."
-                        else:
-                            tot_row = await _q(c, "SELECT COUNT(*) AS n FROM mm_match_players WHERE match_number=$1", self.mn)
-                            if (tot_row["n"] if tot_row else 0) >= QUEUE_SIZE:
-                                error_msg = "This queue is already full."
+                        error_msg = f"The {ROLE_LABELS[role]} slot is full."
 
                     if error_msg is None:
                         weight = vip_data.VIP_CAPTAIN_PRIORITY_WEIGHT.get(vip["tier"], 0) if vip else 0
@@ -825,6 +840,7 @@ class JoinQueueView(discord.ui.View):
                         msg = await channel.fetch_message(updater.message_id)
                         await msg.edit(embed=emb, view=vv)
                         vv.message = msg
+                        vv.start_countdown()
                 except discord.HTTPException:
                     pass
 
@@ -914,14 +930,18 @@ class VoteView(discord.ui.View):
       lock is safe.
     """
 
+    VOTE_SECONDS = 30
+
     def __init__(self, cog: "MMCog", match_number: int, total: int):
-        super().__init__(timeout=30)
+        super().__init__(timeout=self.VOTE_SECONDS)
         self.cog      = cog
         self.mn       = match_number
         self.total    = total
         self.votes:   dict[str, str] = {}
         self.message: discord.Message | None = None
         self.resolved = False
+        self._seconds_left = self.VOTE_SECONDS
+        self._countdown_task: asyncio.Task | None = None
 
         for item in self.children:
             if isinstance(item, discord.ui.Button):
@@ -929,6 +949,34 @@ class VoteView(discord.ui.View):
                     item.custom_id = f"vr_{match_number}"
                 elif item.custom_id == "vc":
                     item.custom_id = f"vc_{match_number}"
+
+    def start_countdown(self) -> None:
+        """Start the 1-second countdown task that updates the embed timer."""
+        if self._countdown_task is None or self._countdown_task.done():
+            self._countdown_task = asyncio.create_task(self._run_countdown())
+
+    async def _run_countdown(self) -> None:
+        """Edit the vote embed every second to show the remaining time."""
+        import time as _time
+        start = _time.monotonic()
+        while not self.resolved:
+            await asyncio.sleep(1)
+            if self.resolved:
+                break
+            elapsed = int(_time.monotonic() - start)
+            self._seconds_left = max(0, self.VOTE_SECONDS - elapsed)
+            if self.message is None:
+                continue
+            async with database.conn() as c:
+                match_row = await db_get_match(c, self.mn)
+                if not match_row:
+                    break
+                rv, cv = self._tally()
+                emb = embed_vote(match_row, rv, cv, len(self.votes), self.total, self._seconds_left)
+            try:
+                await self.message.edit(embed=emb, view=self)
+            except discord.HTTPException:
+                pass
 
     def _tally(self) -> tuple[int, int]:
         rv = sum(1 for v in self.votes.values() if v == "r")
@@ -1012,6 +1060,8 @@ class VoteView(discord.ui.View):
         """
         self.stop()
         self.cog.clear_vote_view(self.mn)
+        if self._countdown_task and not self._countdown_task.done():
+            self._countdown_task.cancel()
 
         rv, cv   = self._tally()
         use_rand = rv > cv
@@ -1691,6 +1741,30 @@ class MMCog(commands.Cog):
         if u:
             u.stop()
 
+    async def _send_queue_notify_dms(
+        self,
+        guild: discord.Guild | None,
+        match_number: int,
+        queue_url: str,
+    ) -> None:
+        """DM every player who opted into /mm notify when a new queue opens."""
+        if not guild:
+            return
+        async with database.conn() as c:
+            rows = await _qa(c,
+                "SELECT discord_id FROM mm_players WHERE mm_notify = true")
+        for row in rows:
+            member = guild.get_member(int(row["discord_id"]))
+            if member and not member.bot:
+                try:
+                    await member.send(
+                        f"🏐 **New Matchmaking Queue opened! — #{match_number}**\n"
+                        f"Jump in: {queue_url}\n\n"
+                        f"*(Use `/mm notify off` to stop these DMs)*"
+                    )
+                except discord.Forbidden:
+                    pass
+
     # ── finalize ────────────────────────────────────────────────────────
 
     async def finalize(self, interaction: discord.Interaction,
@@ -1887,6 +1961,9 @@ class MMCog(commands.Cog):
         updater = QueueUpdater(self.bot, number, sent.channel.id, sent.id)
         self.set_updater(number, updater)
 
+        # Notify players who opted in to queue DMs.
+        asyncio.create_task(self._send_queue_notify_dms(i.guild, number, sent.jump_url))
+
     @mm.command(name="cancel", description="Cancels a Matchmaking queue or match")
     async def mm_cancel(self, i: discord.Interaction, number: int):
         if not isinstance(i.user, discord.Member) or not can_manage_mm(i.user):
@@ -1960,6 +2037,38 @@ class MMCog(commands.Cog):
         else:
             await i.followup.send(f"Match #{number} finished.", ephemeral=True)
 
+    # ------------------------------------------------------------------
+    # /mm notify on | off
+    # ------------------------------------------------------------------
+
+    @mm.command(name="notify", description="Toggle DM notifications when a new queue opens")
+    @app_commands.describe(setting="on to receive DMs, off to stop")
+    @app_commands.choices(setting=[
+        app_commands.Choice(name="on",  value="on"),
+        app_commands.Choice(name="off", value="off"),
+    ])
+    async def mm_notify(self, i: discord.Interaction, setting: app_commands.Choice[str]):
+        if not isinstance(i.user, discord.Member):
+            return
+        await i.response.defer(ephemeral=True)
+
+        uid    = database.did(i.user.id)
+        enable = setting.value == "on"
+
+        async with database.conn() as c:
+            await _x(c,
+                "INSERT INTO mm_players (discord_id, mm_notify) VALUES ($1, $2) "
+                "ON CONFLICT (discord_id) DO UPDATE SET mm_notify = $2",
+                uid, enable)
+
+        status = "**enabled** ✅" if enable else "**disabled** ❌"
+        await i.followup.send(
+            f"Queue DM notifications {status}.\n"
+            + ("You'll receive a DM whenever a new matchmaking queue opens." if enable
+               else "You won't receive queue DMs anymore."),
+            ephemeral=True
+        )
+
     @mm.command(name="elo", description="Shows your Matchmaking ELO")
     async def mm_elo(self, i: discord.Interaction, member: discord.Member | None = None):
         target  = member or i.user
@@ -2024,9 +2133,9 @@ class MMCog(commands.Cog):
             description=f"Buy on the site: {config.NVL_SITE_URL}/matchmaking#vip\nPix via Stripe. Valid {vip_data.VIP_DURATION_DAYS} days.",
             color=discord.Color.gold())
         e.add_field(name=f"VIP — {vip_data.VIP_PRICING['vip']['label']} / 30d",
-                    value=f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip']*100)}% ELO on wins\n• Exclusive role + badge\n• VIP queue (2x ELO)", inline=False)
+                    value=f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip']*100)}% ELO on wins\n• Exclusive role + badge\n• Access to the Queue voice channel\n• VIP queue (2x ELO)", inline=False)
         e.add_field(name=f"VIP+ — {vip_data.VIP_PRICING['vip_plus']['label']} / 30d",
-                    value=f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip_plus']*100)}% ELO on wins\n• Priority queue join\n• Exclusive role + badge\n• VIP queue (2x ELO)", inline=False)
+                    value=f"• +{round(vip_data.VIP_ELO_WIN_BONUS_PERCENT['vip_plus']*100)}% ELO on wins\n• Exclusive role + badge\n• Access to the Queue voice channel\n• VIP queue (2x ELO)", inline=False)
         val = f"**{vip_data.vip_tier_label(my_vip['tier'])}** until `{my_vip['expires_at']}`." if my_vip else "No active subscription."
         e.add_field(name="Your status", value=val, inline=False)
         await i.response.send_message(embed=e, ephemeral=True)
