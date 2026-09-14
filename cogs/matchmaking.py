@@ -1043,12 +1043,16 @@ class VoteView(discord.ui.View):
         await self._vote(i, "c")
 
     async def on_timeout(self):
+        # discord.py timeout is the final authority if not all players voted.
+        # Close interaction buttons immediately and resolve the state once.
         lock = self.cog.get_lock(self.mn)
         async with lock:
             if self.resolved:
                 return
             self.resolved = True
-        # Outside the lock.
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
         guild = self.cog.bot.get_guild(config.GUILD_ID)
         await self._do_resolve(guild)
 
@@ -1101,8 +1105,8 @@ class VoteView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(embed=emb, view=view)
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                print(f"[MATCHMAKING] Failed to update vote message for {self.mn}: {exc}")
 
 
 # ---------------------------------------------------------------
