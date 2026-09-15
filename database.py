@@ -98,6 +98,44 @@ async def fetchall(query: str, *params: Any) -> list[asyncpg.Record]:
 
 
 
+async def update_returning(
+    table: str,
+    values: dict[str, Any],
+    where: dict[str, Any],
+) -> asyncpg.Record | None:
+    """Update a row and return the updated record.
+
+    Table and column names are supplied by internal bot code.
+    """
+    if not values:
+        raise ValueError("update_returning requires values.")
+    if not where:
+        raise ValueError("update_returning requires where conditions.")
+
+    columns = list(values.keys())
+    params = []
+    assignments = []
+
+    for column in columns:
+        params.append(values[column])
+        assignments.append(f"{column} = ${len(params)}")
+
+    where_clauses = []
+    for column, value in where.items():
+        params.append(value)
+        where_clauses.append(f"{column} = ${len(params)}")
+
+    query = (
+        f"UPDATE {table} "
+        f"SET {', '.join(assignments)} "
+        f"WHERE {' AND '.join(where_clauses)} "
+        "RETURNING *"
+    )
+
+    async with _require_pool().acquire() as c:
+        return await c.fetchrow(query, *params)
+
+
 async def insert_returning(table: str, values: dict[str, Any]) -> asyncpg.Record | None:
     """Insert a row and return the created record.
 
