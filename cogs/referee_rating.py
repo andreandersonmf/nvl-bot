@@ -184,14 +184,15 @@ class RefereeRatingCog(commands.Cog):
             return
 
         for row in rows:
-            await self._send_rating_dms(guild, row)
-            await database.execute(
-                "UPDATE matches SET discord_rating_sent = true WHERE id = $1",
-                row["id"]
-            )
+            sent_count = await self._send_rating_dms(guild, row)
+            if sent_count > 0:
+                await database.execute(
+                    "UPDATE matches SET discord_rating_sent = true WHERE id = $1",
+                    row["id"]
+                )
 
-    async def _send_rating_dms(self, guild: discord.Guild, row) -> None:
-        """Send rating DMs to both team captains."""
+    async def _send_rating_dms(self, guild: discord.Guild, row) -> int:
+        """Send rating DMs to both team captains and return the number delivered."""
         home_team = await database.fetchone(
             "SELECT captain_discord_id FROM teams WHERE country = $1",
             row["home_country"]
@@ -210,10 +211,23 @@ class RefereeRatingCog(commands.Cog):
             if team and team["captain_discord_id"]:
                 captain_ids.add(str(team["captain_discord_id"]))
 
+        sent_count = 0
+
         for captain_did in captain_ids:
-            member = guild.get_member(int(captain_did))
-            if not member or member.bot:
+            # OAuth/profile sync may have the correct Discord ID even when the
+            # member is not present in discord.py's local cache. fetch_member
+            # makes the DM flow reliable instead of silently skipping them.
+            try:
+                member = guild.get_member(int(captain_did))
+                if member is None:
+                    member = await guild.fetch_member(int(captain_did))
+            except (ValueError, discord.NotFound, discord.HTTPException):
+                print(f"[referee_rating] Captain {captain_did} could not be resolved in guild.")
                 continue
+
+            if member.bot:
+                continue
+
             try:
                 embed = discord.Embed(
                     title=f"⭐ Rate the Referee{star}",
@@ -231,10 +245,16 @@ class RefereeRatingCog(commands.Cog):
                     captain_discord_id  = captain_did,
                 )
                 await member.send(embed=embed, view=view)
+                sent_count += 1
             except discord.Forbidden:
-                pass
+                print(f"[referee_rating] DMs are disabled for captain {captain_did}.")
             except Exception as e:
                 print(f"[referee_rating] DM error for {captain_did}: {e}")
+
+        if not captain_ids:
+            print(f"[referee_rating] Match {match_id} has no captain Discord IDs; rating request will retry.")
+
+        return sent_count
 
     @rating_loop.before_loop
     async def before_loop(self):
